@@ -579,21 +579,34 @@ export default {
         }
 
         if (!dohResponse) {
-          dohResponse = await fetch(targetUrl.toString(), {
+          const fetchOptions = {
             method: method,
             headers: forwardHeaders,
-            body: requestBody,
             cf: {
               // Cloudflare specific features
               http3: true
             }
-          });
+          };
+          if (method !== 'GET' && method !== 'HEAD' && requestBody) {
+            fetchOptions.body = requestBody;
+          }
+
+          dohResponse = await fetch(targetUrl.toString(), fetchOptions);
 
           // Store response in cache if status is OK
           if (isCacheEnabled && cacheKey && dohResponse.status === 200) {
-            // Clone and set custom Cache-Control header to keep it in edge cache
-            const cacheResponse = new Response(dohResponse.clone().body, dohResponse);
-            cacheResponse.headers.set('Cache-Control', 'public, max-age=60');
+            // Clone and sanitize headers to avoid caching compressed header with decompressed body
+            const cacheHeaders = new Headers(dohResponse.headers);
+            cacheHeaders.delete('Content-Encoding');
+            cacheHeaders.delete('Content-Length');
+            cacheHeaders.delete('Transfer-Encoding');
+            cacheHeaders.set('Cache-Control', 'public, max-age=60');
+
+            const cacheResponse = new Response(dohResponse.clone().body, {
+              status: dohResponse.status,
+              statusText: dohResponse.statusText,
+              headers: cacheHeaders
+            });
             ctx.waitUntil(cache.put(cacheKey, cacheResponse));
           }
         }
@@ -628,8 +641,18 @@ export default {
       }
 
       // Return DNS message response with correct binary headers
-      const clientResponse = new Response(dohResponse.body, dohResponse);
-      clientResponse.headers.set('Access-Control-Allow-Origin', '*');
+      // We clean headers to prevent transfer/compression/length decoding issues on the client side
+      const responseHeaders = new Headers(dohResponse.headers);
+      responseHeaders.delete('Content-Encoding');
+      responseHeaders.delete('Content-Length');
+      responseHeaders.delete('Transfer-Encoding');
+      responseHeaders.set('Access-Control-Allow-Origin', '*');
+
+      const clientResponse = new Response(dohResponse.body, {
+        status: dohResponse.status,
+        statusText: dohResponse.statusText,
+        headers: responseHeaders
+      });
       return clientResponse;
     }
 
