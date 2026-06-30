@@ -1231,6 +1231,7 @@ const ADMIN_HTML = `<!DOCTYPE html>
                   <tr class="bg-slate-50 dark:bg-slate-950 text-slate-400 uppercase text-xs font-semibold border-b border-slate-200 dark:border-slate-800">
                     <th class="p-4">Username</th>
                     <th class="p-4">UUID Key</th>
+                    <th class="p-4">DoH Connection (Intra)</th>
                     <th class="p-4">Status</th>
                     <th class="p-4">Limit (GB)</th>
                     <th class="p-4">Used (GB)</th>
@@ -1503,6 +1504,49 @@ const ADMIN_HTML = `<!DOCTYPE html>
   </footer>
 
   <script>
+    // Copy to clipboard helper
+    function copyToClipboard(text, btn) {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(() => {
+          showCopySuccess(btn);
+        }).catch(() => {
+          fallbackCopyText(text, btn);
+        });
+      } else {
+        fallbackCopyText(text, btn);
+      }
+    }
+
+    function fallbackCopyText(text, btn) {
+      const textArea = document.createElement("textarea");
+      textArea.value = text;
+      textArea.style.position = "fixed";  // avoid scrolling to bottom
+      document.body.appendChild(textArea);
+      textArea.focus();
+      textArea.select();
+      try {
+        document.execCommand('copy');
+        showCopySuccess(btn);
+      } catch (err) {
+        console.error('Fallback copy failed', err);
+      }
+      document.body.removeChild(textArea);
+    }
+
+    function showCopySuccess(btn) {
+      const originalHtml = btn.innerHTML;
+      btn.innerHTML = '<i data-lucide="check" class="w-3.5 h-3.5 text-emerald-500"></i>';
+      btn.classList.add('bg-emerald-500/10', 'border-emerald-500/20');
+      btn.classList.remove('text-blue-500', 'border-blue-500/10');
+      lucide.createIcons();
+      setTimeout(() => {
+        btn.innerHTML = originalHtml;
+        btn.classList.remove('bg-emerald-500/10', 'border-emerald-500/20');
+        btn.classList.add('text-blue-500', 'border-blue-500/10');
+        lucide.createIcons();
+      }, 1500);
+    }
+
     // State values
     let sessionToken = localStorage.getItem('jwt_token') || '';
     let appData = null;
@@ -1729,7 +1773,7 @@ const ADMIN_HTML = `<!DOCTYPE html>
         tbody.innerHTML = '';
 
         if (!data.users || data.users.length === 0) {
-          tbody.innerHTML = '<tr><td colspan="8" class="p-8 text-center text-slate-400">No users found matching query criteria.</td></tr>';
+          tbody.innerHTML = '<tr><td colspan="9" class="p-8 text-center text-slate-400">No users found matching query criteria.</td></tr>';
           return;
         }
 
@@ -1750,11 +1794,25 @@ const ADMIN_HTML = `<!DOCTYPE html>
 
           const formattedExpiry = u.expire_at ? new Date(u.expire_at).toLocaleString() : 'Lifetime';
 
+          let host = window.location.host;
+          if (host.includes('localhost') || host.includes('run.app') || host.includes('aistudio')) {
+            host = 'doh-picko.g6812626.workers.dev';
+          }
+          const dohLink = 'https://' + host + '/dns-query/' + u.uuid;
+
           const tr = document.createElement('tr');
           tr.className = "border-b border-slate-100 dark:border-slate-800/60 hover:bg-slate-50/50 dark:hover:bg-slate-900/40";
           tr.innerHTML = \`
             <td class="p-4 font-semibold">\${u.username}</td>
             <td class="p-4 font-mono text-xs select-all bg-slate-50 dark:bg-slate-950/50 p-1.5 rounded border border-slate-100 dark:border-slate-900">\${u.uuid}</td>
+            <td class="p-4">
+              <div class="flex items-center gap-1.5 max-w-[280px]">
+                <input type="text" readonly value="\${dohLink}" class="w-full font-mono text-xs select-all bg-slate-50 dark:bg-slate-950/50 p-1 rounded border border-slate-100 dark:border-slate-900 focus:outline-none" onclick="this.select()">
+                <button onclick="copyToClipboard('\${dohLink}', this)" class="p-1 text-blue-500 hover:bg-blue-500/10 rounded border border-blue-500/10 transition flex items-center justify-center shrink-0" title="Copy DoH Connection URL">
+                  <i data-lucide="copy" class="w-3.5 h-3.5"></i>
+                </button>
+              </div>
+            </td>
             <td class="p-4">\${statusBadge}</td>
             <td class="p-4 font-mono text-xs font-medium">\${u.traffic_limit_gb.toFixed(1)} GB</td>
             <td class="p-4 font-mono text-xs text-slate-500">\${u.used_gb.toFixed(4)} GB</td>
