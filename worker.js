@@ -330,13 +330,82 @@ export default {
       const uuid = pathUuid || queryUuid;
 
       if (!uuid) {
+        // If they open standard /dns-query in browser, show a helpful message
+        if (method === 'GET' && !url.searchParams.has('dns')) {
+          return new Response(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>DNS over HTTPS Gateway</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen flex items-center justify-center font-sans p-6">
+  <div class="max-w-md w-full bg-slate-900 border border-slate-800 p-8 rounded-2xl shadow-xl text-center space-y-4">
+    <div class="text-orange-500 font-bold text-3xl font-mono">CF DoH</div>
+    <h1 class="text-xl font-bold text-white">DNS over HTTPS Gateway</h1>
+    <p class="text-sm text-slate-400">Please provide your personal subscription UUID in the URL path, for example:</p>
+    <code class="block bg-slate-950 p-3 rounded-lg text-xs text-orange-400 border border-slate-800 break-all select-all">https://${url.host}/dns-query/YOUR-SUBSCRIBER-UUID</code>
+  </div>
+</body>
+</html>`, {
+            status: 200,
+            headers: { 'Content-Type': 'text/html; charset=utf-8' }
+          });
+        }
         return new Response("Missing subscriber UUID.", { status: 400, headers: corsHeaders() });
       }
 
       // Look up subscription user
       const user = await env.DB.prepare("SELECT * FROM users WHERE uuid = ?").bind(uuid).first();
       if (!user) {
+        if (method === 'GET' && !url.searchParams.has('dns')) {
+          return new Response(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Subscription Not Found</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen flex items-center justify-center font-sans p-6">
+  <div class="max-w-md w-full bg-slate-900 border border-slate-800 p-8 rounded-2xl shadow-xl text-center space-y-4">
+    <div class="text-red-500 font-bold text-3xl font-mono">⚠️ ERROR</div>
+    <h1 class="text-xl font-bold text-white">Invalid Subscription</h1>
+    <p class="text-sm text-slate-400">The subscriber UUID provided in the URL was not found or is invalid. Please contact your administrator to obtain a valid subscription URL.</p>
+  </div>
+</body>
+</html>`, {
+            status: 404,
+            headers: { 'Content-Type': 'text/html; charset=utf-8' }
+          });
+        }
         return new Response("User not found or invalid UUID.", { status: 403, headers: corsHeaders() });
+      }
+
+      // Retrieve DNS providers from D1 or KV
+      let providers = [];
+      const cachedProviders = env.KV ? await env.KV.get('active_dns_providers') : null;
+      if (cachedProviders) {
+        providers = JSON.parse(cachedProviders);
+      } else {
+        const provRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'dns_providers'").first();
+        if (provRow) {
+          providers = JSON.parse(provRow.value);
+          if (env.KV) await env.KV.put('active_dns_providers', provRow.value, { expirationTtl: 60 });
+        }
+      }
+      if (!providers || providers.length === 0) {
+        providers = DEFAULT_DNS_PROVIDERS;
+      }
+
+      // If this is a browser visit (GET request and no 'dns' query param), serve the beautiful dashboard page!
+      if (method === 'GET' && !url.searchParams.has('dns')) {
+        return new Response(getSubscriberPageHTML(user, url.host, providers), {
+          status: 200,
+          headers: {
+            'Content-Type': 'text/html; charset=utf-8',
+            ...corsHeaders()
+          }
+        });
       }
 
       // Check user block status
@@ -354,10 +423,6 @@ export default {
         }
       }
 
-      // Load parameters
-      const queriesPerGbRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'queries_per_gb'").first();
-      const queriesPerGb = parseInt(queriesPerGbRow?.value || '5000', 10);
-
       // Check traffic limits
       if (user.used_gb >= user.traffic_limit_gb) {
         // Disable subscription immediately
@@ -365,28 +430,26 @@ export default {
         return new Response("Traffic quota exceeded.", { status: 403, headers: corsHeaders() });
       }
 
-      // Retrieve DNS providers from D1 or KV
-      let providers = [];
-      const cachedProviders = env.KV ? await env.KV.get('active_dns_providers') : null;
-      if (cachedProviders) {
-        providers = JSON.parse(cachedProviders);
-      } else {
-        const provRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'dns_providers'").first();
-        if (provRow) {
-          providers = JSON.parse(provRow.value);
-          if (env.KV) await env.KV.put('active_dns_providers', provRow.value, { expirationTtl: 60 });
-        }
-      }
+      // Load parameters
+      const queriesPerGbRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'queries_per_gb'").first();
+      const queriesPerGb = parseInt(queriesPerGbRow?.value || '5000', 10);
 
       // Determine DNS Provider URL
       const customProvider = url.searchParams.get('provider');
-      let targetProvider = providers.find(p => p.enabled && (customProvider ? p.name.toLowerCase() === customProvider.toLowerCase() : false));
-      
+      let targetProvider = null;
+      if (providers && providers.length > 0) {
+        if (customProvider) {
+          targetProvider = providers.find(p => p.enabled && p.name.toLowerCase() === customProvider.toLowerCase());
+        }
+        if (!targetProvider) {
+          // Fallback to default setting
+          const defaultDnsRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'default_dns'").first();
+          const defaultDnsName = defaultDnsRow?.value || 'Cloudflare';
+          targetProvider = providers.find(p => p.name.toLowerCase() === defaultDnsName.toLowerCase() && p.enabled) || providers.find(p => p.enabled);
+        }
+      }
       if (!targetProvider) {
-        // Fallback to default setting
-        const defaultDnsRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'default_dns'").first();
-        const defaultDnsName = defaultDnsRow?.value || 'Cloudflare';
-        targetProvider = providers.find(p => p.name.toLowerCase() === defaultDnsName.toLowerCase() && p.enabled) || providers.find(p => p.enabled);
+        targetProvider = DEFAULT_DNS_PROVIDERS.find(p => p.name === 'Cloudflare');
       }
 
       const targetUrlStr = targetProvider ? targetProvider.url : 'https://1.1.1.1/dns-query';
@@ -2347,3 +2410,331 @@ const ADMIN_HTML = `<!DOCTYPE html>
 </body>
 </html>
 `;
+
+function getSubscriberPageHTML(user, host, providers) {
+  // Determine user status
+  let status = 'ACTIVE';
+  let statusColor = 'text-emerald-500 bg-emerald-500/10 border-emerald-500/20';
+  let isExpired = false;
+  let isQuotaExceeded = false;
+
+  if (user.expire_at) {
+    const expireTime = new Date(user.expire_at).getTime();
+    if (Date.now() > expireTime) {
+      isExpired = true;
+    }
+  }
+  if (user.used_gb >= user.traffic_limit_gb) {
+    isQuotaExceeded = true;
+  }
+
+  if (user.enabled !== 1) {
+    status = 'BLOCKED';
+    statusColor = 'text-red-500 bg-red-500/10 border-red-500/20';
+  } else if (isExpired) {
+    status = 'EXPIRED';
+    statusColor = 'text-amber-500 bg-amber-500/10 border-amber-500/20';
+  } else if (isQuotaExceeded) {
+    status = 'LIMIT EXCEEDED';
+    statusColor = 'text-amber-500 bg-amber-500/10 border-amber-500/20';
+  }
+
+  const usedGb = parseFloat(user.used_gb.toFixed(4));
+  const limitGb = parseFloat(user.traffic_limit_gb.toFixed(2));
+  const percent = Math.min(100, Math.max(0, (usedGb / limitGb) * 100)).toFixed(1);
+  const remainingGb = parseFloat((limitGb - usedGb).toFixed(4));
+  const formattedExpiry = user.expire_at ? new Date(user.expire_at).toLocaleString() : 'Lifetime';
+
+  // Format providers to show only enabled ones
+  const enabledProviders = providers.filter(p => p.enabled);
+  const defaultProvider = enabledProviders[0]?.name || 'Cloudflare';
+
+  return `<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DNS Over HTTPS Subscription | ${user.username}</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap">
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <style>
+    :root {
+      --cf-orange: #f6821f;
+      --cf-dark: #0f172a;
+      --cf-card: #1e293b;
+      --cf-border: #334155;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+    }
+    body {
+      font-family: 'Inter', sans-serif;
+      background-color: #0b1120;
+    }
+    .font-display {
+      font-family: 'Space Grotesk', sans-serif;
+    }
+  </style>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            orange: {
+              500: '#f6821f',
+              600: '#e06e12',
+            }
+          }
+        }
+      }
+    }
+  </script>
+</head>
+<body class="text-slate-100 min-h-screen flex flex-col justify-between">
+
+  <!-- Header -->
+  <header class="border-b border-slate-800 bg-slate-900/50 backdrop-blur-md sticky top-0 z-40">
+    <div class="max-w-6xl mx-auto px-4 py-4 flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <div class="p-2.5 bg-orange-500 text-white rounded-xl font-bold font-display tracking-tight shadow-lg shadow-orange-500/20">
+          CF
+        </div>
+        <div>
+          <span class="font-display font-bold text-base tracking-tight block">Secure DoH Service</span>
+          <span class="text-[10px] block text-emerald-400 font-medium">● Network Node Connected</span>
+        </div>
+      </div>
+      <div class="flex items-center gap-2">
+        <span class="px-2.5 py-1 text-xs font-semibold rounded-full border ${statusColor}">
+          ${status}
+        </span>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Dashboard -->
+  <main class="max-w-6xl w-full mx-auto px-4 py-8 flex-1 grid grid-cols-1 lg:grid-cols-12 gap-8">
+    
+    <!-- LEFT PANEL: Subscription details -->
+    <section class="lg:col-span-5 space-y-6">
+      <div class="bg-slate-900 border border-slate-800 p-6 rounded-2xl shadow-xl space-y-6">
+        <div class="flex items-center gap-4">
+          <div class="w-12 h-12 rounded-2xl bg-orange-500/10 flex items-center justify-center border border-orange-500/20">
+            <i data-lucide="user" class="w-6 h-6 text-orange-500"></i>
+          </div>
+          <div>
+            <h2 class="font-display font-bold text-lg text-white">${user.username}</h2>
+            <p class="text-xs text-slate-400">Subscriber Dashboard</p>
+          </div>
+        </div>
+
+        <div class="border-t border-slate-800/80 pt-4 space-y-4">
+          <div>
+            <div class="flex justify-between text-xs font-medium text-slate-400 mb-1.5">
+              <span>Traffic Consumption</span>
+              <span>${percent}%</span>
+            </div>
+            <!-- Progress Bar -->
+            <div class="w-full bg-slate-800 rounded-full h-3.5 overflow-hidden p-[2px] border border-slate-700/50">
+              <div class="bg-gradient-to-r from-orange-500 to-amber-500 h-full rounded-full transition-all duration-500" style="width: ${percent}%"></div>
+            </div>
+            <div class="flex justify-between text-xs text-slate-500 mt-1.5">
+              <span>Used: <strong class="text-slate-300 font-mono">${usedGb} GB</strong></span>
+              <span>Limit: <strong class="text-slate-300 font-mono">${limitGb} GB</strong></span>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-2 gap-4 border-t border-slate-800/80 pt-4">
+            <div class="bg-slate-950/40 p-3 rounded-xl border border-slate-800/50">
+              <span class="text-[10px] uppercase tracking-wider text-slate-500 block mb-0.5">Remaining Traffic</span>
+              <span class="text-sm font-bold font-mono text-emerald-400">${remainingGb < 0 ? 0 : remainingGb} GB</span>
+            </div>
+            <div class="bg-slate-950/40 p-3 rounded-xl border border-slate-800/50">
+              <span class="text-[10px] uppercase tracking-wider text-slate-500 block mb-0.5">Total Queries</span>
+              <span class="text-sm font-bold font-mono text-blue-400">${user.query_count}</span>
+            </div>
+          </div>
+
+          <div class="space-y-2 border-t border-slate-800/80 pt-4 text-xs text-slate-400">
+            <div class="flex justify-between">
+              <span>UUID Token:</span>
+              <span class="font-mono text-slate-200 select-all">${user.uuid}</span>
+            </div>
+            <div class="flex justify-between">
+              <span>Expiration Date:</span>
+              <span class="font-medium text-slate-200">${formattedExpiry}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Support card -->
+      <div class="bg-slate-900/50 border border-slate-800/50 p-6 rounded-2xl space-y-3">
+        <h4 class="font-display font-bold text-sm text-slate-300 flex items-center gap-2">
+          <i data-lucide="shield" class="w-4 h-4 text-orange-500"></i>
+          <span>Secure DNS Encryption</span>
+        </h4>
+        <p class="text-xs text-slate-400 leading-relaxed">
+          Your connection is encrypted using TLS 1.3, preventing your Internet Service Provider (ISP) or local network admins from eavesdropping on your DNS inquiries.
+        </p>
+      </div>
+    </section>
+
+    <!-- RIGHT PANEL: Interactive DNS Connection Setup -->
+    <section class="lg:col-span-7 space-y-6">
+      <div class="bg-slate-900 border border-slate-800 p-6 rounded-2xl shadow-xl space-y-6">
+        <div>
+          <h3 class="font-display font-bold text-lg text-white">Connection Configuration</h3>
+          <p class="text-xs text-slate-400 mt-1">Select your preferred upstream DNS server to customize your connection URL.</p>
+        </div>
+
+        <!-- DNS Resolver Dropdown -->
+        <div class="space-y-2">
+          <label class="text-xs font-semibold text-slate-300 block">Upstream DNS Resolver</label>
+          <div class="relative">
+            <select id="resolver-select" onchange="updateConnectionLink()" class="w-full px-4 py-3 rounded-xl border border-slate-700 bg-slate-950 text-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-orange-500 appearance-none cursor-pointer">
+              ${enabledProviders.map(p => `<option value="${p.name}">${p.name}</option>`).join('')}
+            </select>
+            <div class="absolute inset-y-0 right-4 flex items-center pointer-events-none text-slate-400">
+              <i data-lucide="chevron-down" class="w-4 h-4"></i>
+            </div>
+          </div>
+        </div>
+
+        <!-- Connection URL -->
+        <div class="space-y-2">
+          <label class="text-xs font-semibold text-slate-300 block">Your Personal DoH Address (Intra / Chrome)</label>
+          <div class="flex gap-2">
+            <input type="text" id="connection-url-input" readonly class="flex-1 px-4 py-3 rounded-xl border border-slate-700 bg-slate-950 text-orange-400 font-mono text-xs select-all focus:outline-none" onclick="this.select()">
+            <button onclick="copyConnectionUrl(this)" class="px-4 bg-orange-500 hover:bg-orange-600 active:scale-95 text-white rounded-xl transition flex items-center justify-center shrink-0 shadow-lg shadow-orange-500/10">
+              <i data-lucide="copy" class="w-4 h-4"></i>
+            </button>
+          </div>
+        </div>
+
+        <!-- Setup Guides tabs -->
+        <div class="border-t border-slate-800 pt-6">
+          <h4 class="font-display font-semibold text-sm text-white mb-4">Client Installation Instructions</h4>
+          
+          <div class="space-y-4">
+            <!-- Intra app -->
+            <div class="p-4 bg-slate-950/40 rounded-xl border border-slate-800/80 space-y-2.5">
+              <div class="flex items-center gap-2">
+                <div class="p-1.5 bg-orange-500/10 rounded-lg text-orange-500">
+                  <i data-lucide="smartphone" class="w-4 h-4"></i>
+                </div>
+                <h5 class="text-xs font-bold text-white">Android: Intra App Integration (Recommended)</h5>
+              </div>
+              <ol class="list-decimal list-inside text-xs text-slate-400 space-y-1.5 pl-1 leading-relaxed">
+                <li>Install the free <strong class="text-slate-300">Intra</strong> app from the Play Store.</li>
+                <li>Open Intra, tap the menu (top left) and choose <strong class="text-slate-300">Settings</strong>.</li>
+                <li>Tap <strong class="text-slate-300">Select DNS Provider</strong> and choose <strong class="text-slate-300">Custom Server URL</strong>.</li>
+                <li>Paste your personal DoH Address from above into the input field and tap <strong class="text-slate-300">Accept</strong>.</li>
+                <li>Turn the switch on the main screen <strong class="text-emerald-400">ON</strong>.</li>
+              </ol>
+            </div>
+
+            <!-- Browser Guide -->
+            <div class="p-4 bg-slate-950/40 rounded-xl border border-slate-800/80 space-y-2.5">
+              <div class="flex items-center gap-2">
+                <div class="p-1.5 bg-blue-500/10 rounded-lg text-blue-400">
+                  <i data-lucide="chrome" class="w-4 h-4"></i>
+                </div>
+                <h5 class="text-xs font-bold text-white">Browsers: Google Chrome / Edge / Brave</h5>
+              </div>
+              <ol class="list-decimal list-inside text-xs text-slate-400 space-y-1.5 pl-1 leading-relaxed">
+                <li>Go to browser <strong class="text-slate-300">Settings</strong>.</li>
+                <li>Search for or navigate to <strong class="text-slate-300">Security & Privacy</strong>.</li>
+                <li>Enable <strong class="text-slate-300">Use secure DNS</strong>.</li>
+                <li>Select <strong class="text-slate-300">Customized / Enter custom provider</strong>.</li>
+                <li>Paste your personal DoH Address into the text box.</li>
+              </ol>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Footer -->
+  <footer class="border-t border-slate-900 bg-slate-950/80 py-6 text-center text-xs text-slate-500">
+    <div class="max-w-6xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-4">
+      <p>&copy; ${new Date().getFullYear()} DNS over HTTPS Gateway. All rights reserved.</p>
+      <div class="flex items-center gap-1.5">
+        <div class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div>
+        <span class="font-medium text-slate-400">Node Secure Endpoint</span>
+      </div>
+    </div>
+  </footer>
+
+  <script>
+    const uuid = "${user.uuid}";
+    const host = "${host}";
+
+    function updateConnectionLink() {
+      const select = document.getElementById('resolver-select');
+      const val = select.value;
+      const input = document.getElementById('connection-url-input');
+      
+      // Determine if selected resolver is the default one to keep URL clean, or append query param
+      const isDefault = select.selectedIndex === 0;
+      
+      if (isDefault) {
+        input.value = 'https://' + host + '/dns-query/' + uuid;
+      } else {
+        input.value = 'https://' + host + '/dns-query/' + uuid + '?provider=' + encodeURIComponent(val);
+      }
+    }
+
+    function copyConnectionUrl(btn) {
+      const input = document.getElementById('connection-url-input');
+      const text = input.value;
+      
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(() => {
+          animateCopyButton(btn);
+        }).catch(() => {
+          fallbackCopy(text, btn);
+        });
+      } else {
+        fallbackCopy(text, btn);
+      }
+    }
+
+    function fallbackCopy(text, btn) {
+      const el = document.createElement('textarea');
+      el.value = text;
+      el.style.position = 'fixed';
+      document.body.appendChild(el);
+      el.select();
+      try {
+        document.execCommand('copy');
+        animateCopyButton(btn);
+      } catch (e) {
+        console.error('fallback copy failed', e);
+      }
+      document.body.removeChild(el);
+    }
+
+    function animateCopyButton(btn) {
+      const originalHtml = btn.innerHTML;
+      btn.innerHTML = '<i data-lucide="check" class="w-4 h-4 text-emerald-400"></i>';
+      btn.classList.add('bg-emerald-500/10', 'border', 'border-emerald-500/30');
+      btn.classList.remove('bg-orange-500', 'hover:bg-orange-600');
+      lucide.createIcons();
+      setTimeout(() => {
+        btn.innerHTML = originalHtml;
+        btn.classList.remove('bg-emerald-500/10', 'border', 'border-emerald-500/30');
+        btn.classList.add('bg-orange-500', 'hover:bg-orange-600');
+        lucide.createIcons();
+      }, 1500);
+    }
+
+    // Initialize connection link on load
+    updateConnectionLink();
+    lucide.createIcons();
+  </script>
+</body>
+</html>`;
+}
