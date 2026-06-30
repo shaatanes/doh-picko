@@ -563,6 +563,8 @@ export default {
         targetProvider = DEFAULT_DNS_PROVIDERS.find(p => p.name === 'Cloudflare');
       }
 
+      let winningProviderName = targetProvider ? targetProvider.name : 'Unknown';
+
       const targetUrlStr = targetProvider ? targetProvider.url : 'https://1.1.1.1/dns-query';
       const targetUrl = new URL(targetUrlStr);
 
@@ -646,7 +648,7 @@ export default {
 
       if (!dohResponseBuffer) {
         try {
-          // Extract queried domain name (QNAME) for intelligent split routing
+          // Extract queried domain name (QNAME) for logging or inspection if needed
           let dnsBuffer = null;
           if (method === 'GET') {
             const dnsParam = url.searchParams.get('dns');
@@ -701,55 +703,7 @@ export default {
 
           const queriedDomain = extractQName(dnsBuffer);
 
-          function shouldUnblock(domain) {
-            if (!domain) return true; // Default to unblocking for compatibility
-            
-            // Standard non-gaming keywords to resolve via ultra-fast global DNS
-            const bypassKeywords = [
-              'google', 'gstatic', 'googleapis', 'youtube', 'ytimg', 'ggpht', 'doubleclick',
-              'apple', 'icloud', 'mzstatic', 'aaplimg', 'itunes',
-              'microsoft', 'windows', 'msn', 'bing', 'office', 'live.com', 'outlook', 'skype',
-              'github', 'githubusercontent', 'git-scm',
-              'amazon', 'aws', 'media-amazon',
-              'cloudflare', 'digicert', 'letsencrypt', 'sectigo',
-              'wikipedia', 'wikimedia',
-              'speedtest', 'fast.com',
-              'instagram', 'facebook', 'fbcdn', 'messenger',
-              'whatsapp', 'wa.me',
-              'telegram', 't.me',
-              'ir', // Iranian domestic domains are direct/not restricted and faster via standard DNS
-              'arvancloud', 'snapp', 'tapsi', 'digikala', 'shaparak', 'divar', 'aparat'
-            ];
-
-            // Direct gaming platforms and keywords
-            const gameKeywords = [
-              'playstation', 'sony', 'playnet', 'p01.net', 'xbox', 'microsoftgames', 'xboxlive', 'xbx',
-              'epicgames', 'steam', 'valve', 'steampowered', 'steamstatic',
-              'origin', 'ea.com', 'ea-cdn', 'eagames',
-              'riotgames', 'leagueoflegends', 'valorant', 'riot',
-              'pubg', 'pubgmobile', 'battlegrounds',
-              'apexlegends', 'battle.net', 'blizzard', 'activision', 'uplay', 'ubisoft',
-              'gta', 'rockstargames', 'rockstargame', 'nintendo', 'epic', 'bnet',
-              'discord', 'twitch', 'spotify', 'roblox', 'minecraft', 'mojang',
-              'supercell', 'clashofclans', 'clashroyale', 'brawlstars',
-              'genshin', 'hoyoverse', 'mihoyo', 'warframe', 'wargaming', 'worldoftanks'
-            ];
-
-            // If matches gaming platforms, unblock
-            for (const kw of gameKeywords) {
-              if (domain.includes(kw)) return true;
-            }
-
-            // If matches standard platforms/CDNs, bypass the unblockers
-            for (const kw of bypassKeywords) {
-              if (domain.includes(kw)) return false;
-            }
-
-            // Default fallback is to unblock to guarantee everything else works
-            return true;
-          }
-
-          // Define all unblocking providers
+          // Define all available resolvers
           const unblockingList = [
             { name: 'Radar Game (رادار گیم)', url: 'https://doh.radar.game/dns-query' },
             { name: 'Electro DNS (الکترو)', url: 'https://doh.electro.ir/dns-query' },
@@ -757,45 +711,37 @@ export default {
             { name: 'Shecan (شکن)', url: 'https://free.shecan.ir/dns-query' }
           ];
 
-          function isUnblockingProvider(name) {
-            if (!name) return false;
-            const n = name.toLowerCase();
-            return n.includes('radar') || n.includes('electro') || n.includes('shecan') || n.includes('403');
+          const globalList = [
+            { name: 'Cloudflare', url: 'https://1.1.1.1/dns-query' },
+            { name: 'Google', url: 'https://8.8.8.8/dns-query' },
+            { name: 'Quad9', url: 'https://dns.quad9.net/dns-query' }
+          ];
+
+          // Construct the parallel race list to dynamically find the fastest route
+          const rawRaceList = [];
+          
+          // 1. Primary selected provider goes first
+          if (targetProvider) {
+            rawRaceList.push({ name: targetProvider.name, url: targetUrlStr });
           }
 
-          const targetIsUnblocking = isUnblockingProvider(targetProvider ? targetProvider.name : '');
-          let listToRace = [];
+          // 2. Add unblocking providers
+          for (const p of unblockingList) {
+            rawRaceList.push(p);
+          }
 
-          if (targetIsUnblocking) {
-            const needUnblock = shouldUnblock(queriedDomain);
+          // 3. Add global resolvers
+          for (const g of globalList) {
+            rawRaceList.push(g);
+          }
 
-            if (needUnblock) {
-              // Priority 1: User's selected unblocking provider (placed first)
-              listToRace.push({ name: targetProvider.name, url: targetUrlStr });
-              // Add all other unblocking providers to run in parallel
-              for (const p of unblockingList) {
-                if (p.url !== targetUrlStr) {
-                  listToRace.push(p);
-                }
-              }
-              // Add fast global fallbacks as safety nets
-              listToRace.push({ name: 'Google (Fallback)', url: 'https://8.8.8.8/dns-query' });
-              listToRace.push({ name: 'Cloudflare (Fallback)', url: 'https://1.1.1.1/dns-query' });
-            } else {
-              // Standard domain (like Apple, Microsoft update, etc.) -> Bypass unblocking for 10x faster response and 100% stability!
-              listToRace.push({ name: 'Cloudflare (Fastpass)', url: 'https://1.1.1.1/dns-query' });
-              listToRace.push({ name: 'Google (Fastpass)', url: 'https://8.8.8.8/dns-query' });
-              listToRace.push({ name: 'Quad9 (Fastpass)', url: 'https://dns.quad9.net/dns-query' });
-            }
-          } else {
-            // User chose a regular provider (like Google, Cloudflare, NextDNS, etc.)
-            listToRace.push({ name: targetProvider ? targetProvider.name : 'Target', url: targetUrlStr });
-            // Add standard global backups to race as well to guarantee speed/uptime
-            if (targetUrlStr !== 'https://8.8.8.8/dns-query') {
-              listToRace.push({ name: 'Google Fallback', url: 'https://8.8.8.8/dns-query' });
-            }
-            if (targetUrlStr !== 'https://1.1.1.1/dns-query') {
-              listToRace.push({ name: 'Cloudflare Fallback', url: 'https://1.1.1.1/dns-query' });
+          // Deduplicate the list to avoid double querying the same endpoint
+          const seenUrls = new Set();
+          const listToRace = [];
+          for (const item of rawRaceList) {
+            if (!seenUrls.has(item.url)) {
+              seenUrls.add(item.url);
+              listToRace.push(item);
             }
           }
 
@@ -825,14 +771,18 @@ export default {
                 }
               }
 
+              // Clone headers to prevent shared mutations in parallel fetch requests
+              const headersCopy = new Headers(reqHeaders);
+
               const fetchOptions = {
                 method: reqMethod,
-                headers: reqHeaders,
+                headers: headersCopy,
                 signal: controller.signal
               };
 
+              // Clone body buffer for POST requests to prevent ArrayBuffer detachment in V8/Node.js parallel fetches
               if (reqMethod !== 'GET' && reqMethod !== 'HEAD' && body) {
-                fetchOptions.body = body;
+                fetchOptions.body = body.slice(0);
               }
 
               const res = await fetch(currentUrl.toString(), fetchOptions);
@@ -857,8 +807,7 @@ export default {
             }
           }
 
-          // Use a generous 4.5 seconds total timeout, but since we are racing in parallel,
-          // the successful one will return in milliseconds!
+          // Use a generous 4.5 seconds total timeout. The successful one will return in milliseconds!
           const raceResult = await raceDnsRequests(listToRace, method, forwardHeaders, requestBody, 4500);
 
           dohResponseStatus = raceResult.response.status;
@@ -868,7 +817,7 @@ export default {
             dohResponseHeaders[k] = v;
           }
           dohResponseBuffer = raceResult.buffer;
-          successfulProviderName = raceResult.providerName;
+          winningProviderName = raceResult.providerName;
 
           // Store in in-memory DNS cache
           if (isCacheEnabled && dnsCacheKey && dohResponseStatus === 200) {
@@ -914,7 +863,7 @@ export default {
             await env.DB.prepare(`
               INSERT INTO traffic_logs (uuid, timestamp, provider, client_ip, user_agent)
               VALUES (?, ?, ?, ?, ?)
-            `).bind(uuid, isoNow, targetProvider ? targetProvider.name : 'Unknown', clientIp, userAgent).run();
+            `).bind(uuid, isoNow, winningProviderName, clientIp, userAgent).run();
           } catch (dbErr) {
             console.error('Failed to log DNS usage to DB:', dbErr);
           }
