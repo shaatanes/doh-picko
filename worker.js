@@ -17,7 +17,7 @@ let inMemorySettingsTime = 0;
 const SETTINGS_CACHE_TTL = 30000; // 30 seconds
 
 const dnsCache = new Map();
-const DNS_CACHE_TTL = 60000; // 60 seconds (1 minute Cache)
+const DNS_CACHE_TTL = 300000; // 5 minutes (300 seconds Cache) for ultra-low latency
 
 // Default list of built-in DNS Providers
 const DEFAULT_DNS_PROVIDERS = [
@@ -25,6 +25,7 @@ const DEFAULT_DNS_PROVIDERS = [
   { name: 'Google', url: 'https://8.8.8.8/dns-query', enabled: true, is_built_in: true },
   { name: 'Radar Game (رادار گیم)', url: 'https://doh.radar.game/dns-query', enabled: true, is_built_in: true },
   { name: 'Electro DNS (الکترو)', url: 'https://doh.electro.ir/dns-query', enabled: true, is_built_in: true },
+  { name: '403 Online (۴۰۳ آنلاین)', url: 'https://dns.403.online/dns-query', enabled: true, is_built_in: true },
   { name: 'Shecan (شکن)', url: 'https://free.shecan.ir/dns-query', enabled: true, is_built_in: true },
   { name: 'NordVPN DNS', url: 'https://doh.nordvpn.com/dns-query', enabled: true, is_built_in: true },
   { name: 'Ali DNS (Alibaba)', url: 'https://dns.alidns.com/dns-query', enabled: true, is_built_in: true },
@@ -201,7 +202,8 @@ async function initDb(db, env) {
   const configs = [
     { key: 'queries_per_gb', value: '5000' },
     { key: 'default_dns', value: 'Cloudflare' },
-    { key: 'cloudflare_mode', value: 'Automatic' }
+    { key: 'cloudflare_mode', value: 'Automatic' },
+    { key: 'dns_cache_enabled', value: 'true' }
   ];
 
   for (const conf of configs) {
@@ -644,54 +646,120 @@ export default {
 
       if (!dohResponseBuffer) {
         try {
-          const fetchOptions = {
-            method: method,
-            headers: forwardHeaders
-          };
-          if (method !== 'GET' && method !== 'HEAD' && requestBody) {
-            fetchOptions.body = requestBody;
+          // Define all unblocking providers
+          const unblockingList = [
+            { name: 'Radar Game (رادار گیم)', url: 'https://doh.radar.game/dns-query' },
+            { name: 'Electro DNS (الکترو)', url: 'https://doh.electro.ir/dns-query' },
+            { name: '403 Online (۴۰۳ آنلاین)', url: 'https://dns.403.online/dns-query' },
+            { name: 'Shecan (شکن)', url: 'https://free.shecan.ir/dns-query' }
+          ];
+
+          function isUnblockingProvider(name) {
+            if (!name) return false;
+            const n = name.toLowerCase();
+            return n.includes('radar') || n.includes('electro') || n.includes('shecan') || n.includes('403');
           }
 
-          let dohResponse;
-          try {
-            dohResponse = await fetch(targetUrl.toString(), fetchOptions);
-            if (!dohResponse || dohResponse.status !== 200) {
-              throw new Error(`Upstream returned status ${dohResponse ? dohResponse.status : 'null'}`);
+          const targetIsUnblocking = isUnblockingProvider(targetProvider ? targetProvider.name : '');
+          const urlsToTry = [];
+
+          if (targetIsUnblocking) {
+            // First try the user's selected provider
+            urlsToTry.push({ name: targetProvider.name, url: targetUrlStr });
+            // Then add all other unblocking alternatives
+            for (const p of unblockingList) {
+              if (p.url !== targetUrlStr) {
+                urlsToTry.push(p);
+              }
             }
-          } catch (err) {
-            console.warn(`Upstream DNS ${targetProvider ? targetProvider.name : 'Unknown'} failed, falling back to Google DNS:`, err);
-            
-            // Fallback to Google DNS
-            const fallbackUrl = 'https://8.8.8.8/dns-query';
-            const fallbackOptions = {
+            // Add global fallbacks as last resort
+            urlsToTry.push({ name: 'Google Fallback', url: 'https://8.8.8.8/dns-query' });
+            urlsToTry.push({ name: 'Cloudflare Fallback', url: 'https://1.1.1.1/dns-query' });
+          } else {
+            // Try the standard user-selected provider
+            urlsToTry.push({ name: targetProvider ? targetProvider.name : 'Target', url: targetUrlStr });
+            if (targetUrlStr !== 'https://8.8.8.8/dns-query') {
+              urlsToTry.push({ name: 'Google Fallback', url: 'https://8.8.8.8/dns-query' });
+            }
+            if (targetUrlStr !== 'https://1.1.1.1/dns-query') {
+              urlsToTry.push({ name: 'Cloudflare Fallback', url: 'https://1.1.1.1/dns-query' });
+            }
+          }
+
+          let dohResponse = null;
+          let successfulProviderName = '';
+
+          for (const item of urlsToTry) {
+            const currentUrl = new URL(item.url);
+
+            // Apply Cloudflare Mode options if the current attempt is Cloudflare
+            if (currentUrl.host.includes('1.1.1.1') || currentUrl.host.includes('cloudflare')) {
+              if (cfMode === 'IPv4') {
+                currentUrl.host = '1.1.1.1';
+              } else if (cfMode === 'IPv6') {
+                currentUrl.host = '[2606:4700:4700::1111]';
+              }
+            }
+
+            // Copy incoming search params to current URL, keeping standard DNS query params
+            for (const [key, value] of url.searchParams.entries()) {
+              if (key !== 'provider') {
+                currentUrl.searchParams.set(key, value);
+              }
+            }
+
+            const fetchOptions = {
               method: method,
               headers: forwardHeaders
             };
             if (method !== 'GET' && method !== 'HEAD' && requestBody) {
-              fallbackOptions.body = requestBody;
+              fetchOptions.body = requestBody;
             }
-            dohResponse = await fetch(fallbackUrl, fallbackOptions);
+
+            // Fast timeouts for ultra-low latency & responsive fail-over
+            const isUnblockItem = isUnblockingProvider(item.name);
+            const timeoutDuration = isUnblockItem ? 850 : 1800; // 850ms for unblocking servers, 1.8s for fallback global DNS
+
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), timeoutDuration);
+            fetchOptions.signal = controller.signal;
+
+            try {
+              const res = await fetch(currentUrl.toString(), fetchOptions);
+              clearTimeout(timeoutId);
+
+              if (res && res.status === 200) {
+                dohResponse = res;
+                successfulProviderName = item.name;
+                break; // Found a working provider!
+              }
+            } catch (err) {
+              clearTimeout(timeoutId);
+              // Quietly log and proceed to next provider in fallback sequence
+            }
           }
 
-          if (dohResponse) {
-            dohResponseStatus = dohResponse.status;
-            dohResponseStatusText = dohResponse.statusText;
-            dohResponseHeaders = {};
-            for (const [k, v] of dohResponse.headers.entries()) {
-              dohResponseHeaders[k] = v;
-            }
-            dohResponseBuffer = await dohResponse.arrayBuffer();
+          if (!dohResponse) {
+            throw new Error("All configured and fallback DNS upstreams failed or timed out.");
+          }
 
-            // Store in in-memory DNS cache
-            if (isCacheEnabled && dnsCacheKey && dohResponseStatus === 200) {
-              dnsCache.set(dnsCacheKey, {
-                body: dohResponseBuffer,
-                status: dohResponseStatus,
-                statusText: dohResponseStatusText,
-                headers: dohResponseHeaders,
-                timestamp: Date.now()
-              });
-            }
+          dohResponseStatus = dohResponse.status;
+          dohResponseStatusText = dohResponse.statusText;
+          dohResponseHeaders = {};
+          for (const [k, v] of dohResponse.headers.entries()) {
+            dohResponseHeaders[k] = v;
+          }
+          dohResponseBuffer = await dohResponse.arrayBuffer();
+
+          // Store in in-memory DNS cache
+          if (isCacheEnabled && dnsCacheKey && dohResponseStatus === 200) {
+            dnsCache.set(dnsCacheKey, {
+              body: dohResponseBuffer,
+              status: dohResponseStatus,
+              statusText: dohResponseStatusText,
+              headers: dohResponseHeaders,
+              timestamp: Date.now()
+            });
           }
         } catch (err) {
           return new Response(`Upstream DoH Forwarding Failed: ${err.message}`, { status: 502, headers: corsHeaders() });
