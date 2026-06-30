@@ -12,19 +12,22 @@ const MAX_REQUESTS_PER_WINDOW = 300; // Allow ample queries for DNS clients, lim
 const DEFAULT_DNS_PROVIDERS = [
   { name: 'Cloudflare', url: 'https://1.1.1.1/dns-query', enabled: true, is_built_in: true },
   { name: 'Google', url: 'https://8.8.8.8/dns-query', enabled: true, is_built_in: true },
+  { name: 'Radar Game (رادار گیم)', url: 'https://doh.radar.game/dns-query', enabled: true, is_built_in: true },
+  { name: 'Electro DNS (الکترو)', url: 'https://doh.electro.ir/dns-query', enabled: true, is_built_in: true },
+  { name: 'Shecan (شکن)', url: 'https://free.shecan.ir/dns-query', enabled: true, is_built_in: true },
+  { name: 'NordVPN DNS', url: 'https://doh.nordvpn.com/dns-query', enabled: true, is_built_in: true },
+  { name: 'Ali DNS (Alibaba)', url: 'https://dns.alidns.com/dns-query', enabled: true, is_built_in: true },
+  { name: '114 DNS (Tencent)', url: 'https://doh.pub/dns-query', enabled: true, is_built_in: true },
+  { name: 'Norton Family', url: 'https://doh.family.norton.com/dns-query', enabled: true, is_built_in: true },
   { name: 'Quad9', url: 'https://dns.quad9.net/dns-query', enabled: true, is_built_in: true },
-  { name: 'OpenDNS', url: 'https://doh.opendns.com/dns-query', enabled: true, is_built_in: true },
   { name: 'AdGuard DNS', url: 'https://dns.adguard-dns.com/dns-query', enabled: true, is_built_in: true },
+  { name: 'OpenDNS', url: 'https://doh.opendns.com/dns-query', enabled: true, is_built_in: true },
   { name: 'CleanBrowsing', url: 'https://doh.cleanbrowsing.org/doh/family-filter/', enabled: true, is_built_in: true },
   { name: 'ControlD', url: 'https://dns.controld.com/freedns', enabled: true, is_built_in: true },
   { name: 'NextDNS', url: 'https://dns.nextdns.io', enabled: true, is_built_in: true },
   { name: 'DNS.SB', url: 'https://doh.dns.sb/dns-query', enabled: true, is_built_in: true },
   { name: 'Yandex DNS', url: 'https://common.dns.yandex.ru/dns-query', enabled: true, is_built_in: true },
-  { name: 'AliDNS', url: 'https://dns.alidns.com/dns-query', enabled: true, is_built_in: true },
-  { name: 'Shecan', url: 'https://free.shecan.ir/dns-query', enabled: true, is_built_in: true },
-  { name: 'Electro DNS', url: 'https://electroteam.co/dns-query', enabled: true, is_built_in: true },
-  { name: 'Comodo DNS', url: 'https://doh.securactive.net/dns-query', enabled: true, is_built_in: true },
-  { name: 'NordVPN DNS', url: 'https://doh.nordvpn.com/dns-query', enabled: true, is_built_in: true }
+  { name: 'Comodo DNS', url: 'https://doh.securactive.net/dns-query', enabled: true, is_built_in: true }
 ];
 
 // Database Initialization SQL
@@ -168,7 +171,7 @@ async function verifyJwt(token, secret) {
 }
 
 // Helper: Ensure tables exist and default settings are seeded
-async function initDb(db) {
+async function initDb(db, env) {
   // Run table creators (safe due to IF NOT EXISTS)
   const statements = SCHEMA_SQL.trim().split(';').filter(s => s.trim().length > 0);
   for (const stmt of statements) {
@@ -187,8 +190,7 @@ async function initDb(db) {
   const configs = [
     { key: 'queries_per_gb', value: '5000' },
     { key: 'default_dns', value: 'Cloudflare' },
-    { key: 'cloudflare_mode', value: 'Automatic' },
-    { key: 'dns_providers', value: JSON.stringify(DEFAULT_DNS_PROVIDERS) }
+    { key: 'cloudflare_mode', value: 'Automatic' }
   ];
 
   for (const conf of configs) {
@@ -196,6 +198,38 @@ async function initDb(db) {
     if (!check) {
       await db.prepare("INSERT INTO settings (key, value) VALUES (?, ?)").bind(conf.key, conf.value).run();
     }
+  }
+
+  // Ensure and synchronize all built-in DNS Providers so upgrades don't leave them out
+  const checkProviders = await db.prepare("SELECT value FROM settings WHERE key = 'dns_providers'").first();
+  if (checkProviders) {
+    try {
+      const existing = JSON.parse(checkProviders.value);
+      if (Array.isArray(existing)) {
+        // Keep user's custom DNS providers (where is_built_in is false or missing)
+        const customProviders = existing.filter(p => !p.is_built_in);
+        // Combine our updated built-in ones with their custom ones
+        const merged = [...DEFAULT_DNS_PROVIDERS];
+        for (const cust of customProviders) {
+          if (!merged.some(p => p.name.toLowerCase() === cust.name.toLowerCase())) {
+            merged.push(cust);
+          }
+        }
+        await db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").bind('dns_providers', JSON.stringify(merged)).run();
+      } else {
+        await db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").bind('dns_providers', JSON.stringify(DEFAULT_DNS_PROVIDERS)).run();
+      }
+    } catch (e) {
+      await db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").bind('dns_providers', JSON.stringify(DEFAULT_DNS_PROVIDERS)).run();
+    }
+  } else {
+    await db.prepare("INSERT INTO settings (key, value) VALUES (?, ?)").bind('dns_providers', JSON.stringify(DEFAULT_DNS_PROVIDERS)).run();
+  }
+
+  // Invalidate KV Caches on cold-starts
+  if (env && env.KV) {
+    await env.KV.delete('active_settings_map');
+    await env.KV.delete('active_dns_providers');
   }
 }
 
@@ -240,6 +274,9 @@ async function authenticateAdmin(request, secret) {
   return await verifyJwt(token, secret);
 }
 
+// Track database initialization across requests to avoid redundant table checks
+let dbInitialized = false;
+
 // Worker Main Handler (ES Module Format)
 export default {
   async fetch(request, env, ctx) {
@@ -266,11 +303,14 @@ export default {
       return jsonResponse({ error: 'Too many requests. Please slow down.' }, 429);
     }
 
-    // Auto-init DB (Ensure schemas exist)
-    try {
-      await initDb(env.DB);
-    } catch (e) {
-      return new Response(`Database Initialisation Error: ${e.message}`, { status: 500 });
+    // Auto-init DB (Ensure schemas exist once per isolate lifetime)
+    if (!dbInitialized) {
+      try {
+        await initDb(env.DB, env);
+        dbInitialized = true;
+      } catch (e) {
+        return new Response(`Database Initialisation Error: ${e.message}`, { status: 500 });
+      }
     }
 
     // Ensure JWT Secret is present, fallback to a stable D1 value if not configured in environment
@@ -323,15 +363,19 @@ export default {
 
     // DNS over HTTPS Handler (Checks subscriptions, does accounting, forwards query)
     // Supports path variables /dns-query/:uuid and query params /dns-query?uuid=...
-    const dohMatch = url.pathname.match(/^\/dns-query\/?([a-f0-9\-]+)?$/) || url.pathname.match(/^\/([a-f0-9\-]+)\/dns-query\/?$/);
+    const dohMatch = url.pathname.match(/^\/dns-query\/?([a-fA-F0-9\-]+)?$/) || url.pathname.match(/^\/([a-fA-F0-9\-]+)\/dns-query\/?$/);
     if (dohMatch) {
       const pathUuid = dohMatch[1];
       const queryUuid = url.searchParams.get('uuid');
-      const uuid = pathUuid || queryUuid;
+      const rawUuid = pathUuid || queryUuid;
+      const uuid = rawUuid ? rawUuid.toLowerCase() : null;
+
+      const acceptHeader = request.headers.get('Accept') || '';
+      const isBrowserVisit = method === 'GET' && !url.searchParams.has('dns') && acceptHeader.includes('text/html');
 
       if (!uuid) {
         // If they open standard /dns-query in browser, show a helpful message
-        if (method === 'GET' && !url.searchParams.has('dns')) {
+        if (isBrowserVisit) {
           return new Response(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -352,13 +396,13 @@ export default {
             headers: { 'Content-Type': 'text/html; charset=utf-8' }
           });
         }
-        return new Response("Missing subscriber UUID.", { status: 400, headers: corsHeaders() });
+        return new Response("Missing subscriber UUID. Standard DNS queries must contain a valid dns payload.", { status: 400, headers: corsHeaders() });
       }
 
       // Look up subscription user
       const user = await env.DB.prepare("SELECT * FROM users WHERE uuid = ?").bind(uuid).first();
       if (!user) {
-        if (method === 'GET' && !url.searchParams.has('dns')) {
+        if (isBrowserVisit) {
           return new Response(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -381,16 +425,37 @@ export default {
         return new Response("User not found or invalid UUID.", { status: 403, headers: corsHeaders() });
       }
 
-      // Retrieve DNS providers from D1 or KV
+      // Retrieve all settings in a single fast query (or KV cache)
+      let settingsMap = new Map();
+      const cachedSettingsStr = env.KV ? await env.KV.get('active_settings_map') : null;
+      if (cachedSettingsStr) {
+        try {
+          const cachedArr = JSON.parse(cachedSettingsStr);
+          settingsMap = new Map(cachedArr);
+        } catch (e) {
+          console.error("Failed to parse cached settings:", e);
+        }
+      }
+
+      if (settingsMap.size === 0) {
+        const settingsRows = await env.DB.prepare("SELECT key, value FROM settings").all();
+        if (settingsRows && settingsRows.results) {
+          const arr = settingsRows.results.map(r => [r.key, r.value]);
+          settingsMap = new Map(arr);
+          if (env.KV) {
+            await env.KV.put('active_settings_map', JSON.stringify(arr), { expirationTtl: 60 });
+          }
+        }
+      }
+
+      // 1. Load Providers
       let providers = [];
-      const cachedProviders = env.KV ? await env.KV.get('active_dns_providers') : null;
-      if (cachedProviders) {
-        providers = JSON.parse(cachedProviders);
-      } else {
-        const provRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'dns_providers'").first();
-        if (provRow) {
-          providers = JSON.parse(provRow.value);
-          if (env.KV) await env.KV.put('active_dns_providers', provRow.value, { expirationTtl: 60 });
+      const providersStr = settingsMap.get('dns_providers');
+      if (providersStr) {
+        try {
+          providers = JSON.parse(providersStr);
+        } catch (e) {
+          console.error("Failed to parse providers setting:", e);
         }
       }
       if (!providers || providers.length === 0) {
@@ -398,11 +463,22 @@ export default {
       }
 
       // If this is a browser visit (GET request and no 'dns' query param), serve the beautiful dashboard page!
-      if (method === 'GET' && !url.searchParams.has('dns')) {
+      if (isBrowserVisit) {
         return new Response(getSubscriberPageHTML(user, url.host, providers), {
           status: 200,
           headers: {
             'Content-Type': 'text/html; charset=utf-8',
+            ...corsHeaders()
+          }
+        });
+      }
+
+      // If we got here and there is no 'dns' query param in a GET request, it means a non-browser client is making an invalid query
+      if (method === 'GET' && !url.searchParams.has('dns')) {
+        return new Response("Missing 'dns' query parameter for GET DoH request.", {
+          status: 400,
+          headers: {
+            'Content-Type': 'text/plain',
             ...corsHeaders()
           }
         });
@@ -430,9 +506,12 @@ export default {
         return new Response("Traffic quota exceeded.", { status: 403, headers: corsHeaders() });
       }
 
-      // Load parameters
-      const queriesPerGbRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'queries_per_gb'").first();
-      const queriesPerGb = parseInt(queriesPerGbRow?.value || '5000', 10);
+      // Load other parameters
+      const queriesPerGb = parseInt(settingsMap.get('queries_per_gb') || '5000', 10);
+      const defaultDnsName = settingsMap.get('default_dns') || 'Cloudflare';
+      const cfMode = settingsMap.get('cloudflare_mode') || 'Automatic';
+      const customUa = settingsMap.get('custom_user_agent') || '';
+      const isCacheEnabled = settingsMap.get('dns_cache_enabled') === 'true';
 
       // Determine DNS Provider URL
       const customProvider = url.searchParams.get('provider');
@@ -443,8 +522,6 @@ export default {
         }
         if (!targetProvider) {
           // Fallback to default setting
-          const defaultDnsRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'default_dns'").first();
-          const defaultDnsName = defaultDnsRow?.value || 'Cloudflare';
           targetProvider = providers.find(p => p.name.toLowerCase() === defaultDnsName.toLowerCase() && p.enabled) || providers.find(p => p.enabled);
         }
       }
@@ -456,9 +533,6 @@ export default {
       const targetUrl = new URL(targetUrlStr);
 
       // Apply Cloudflare Options (Cloudflare IP modes, etc.)
-      const cloudflareModeRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'cloudflare_mode'").first();
-      const cfMode = cloudflareModeRow?.value || 'Automatic';
-
       if (targetUrl.host.includes('1.1.1.1') || targetUrl.host.includes('cloudflare')) {
         if (cfMode === 'IPv4') {
           targetUrl.host = '1.1.1.1';
@@ -467,10 +541,11 @@ export default {
         }
       }
 
-      // Append standard search parameters if GET
-      if (method === 'GET') {
-        const dnsParam = url.searchParams.get('dns');
-        if (dnsParam) targetUrl.searchParams.set('dns', dnsParam);
+      // Copy all incoming search parameters to the target URL, except 'provider'
+      for (const [key, value] of url.searchParams.entries()) {
+        if (key !== 'provider') {
+          targetUrl.searchParams.set(key, value);
+        }
       }
 
       // Prepare request forwarding headers
@@ -483,9 +558,8 @@ export default {
       }
 
       // Custom User-Agent
-      const customUaRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'custom_user_agent'").first();
-      if (customUaRow && customUaRow.value) {
-        forwardHeaders.set('User-Agent', customUaRow.value);
+      if (customUa) {
+        forwardHeaders.set('User-Agent', customUa);
       } else {
         forwardHeaders.set('User-Agent', 'DNS-over-HTTPS-Subscription/1.0');
       }
@@ -494,10 +568,6 @@ export default {
       let dohResponse;
       try {
         const requestBody = method === 'POST' ? await request.arrayBuffer() : null;
-        
-        // Cache management if DNS Cache is enabled
-        const cacheEnabledRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'dns_cache_enabled'").first();
-        const isCacheEnabled = cacheEnabledRow?.value === 'true';
         const cache = caches.default;
         
         let cacheKey = null;
@@ -809,7 +879,18 @@ export default {
         try {
           const { defaultDns, cfMode, dnsCache, customUa, queriesPerGb, adminPassword, providers } = await request.json();
 
+          // Fetch current providers list to validate defaultDns
+          let currentProviders = providers;
+          if (!currentProviders) {
+            const configProvidersRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'dns_providers'").first();
+            currentProviders = configProvidersRow ? JSON.parse(configProvidersRow.value) : DEFAULT_DNS_PROVIDERS;
+          }
+
           if (defaultDns !== undefined) {
+            const selectedProv = currentProviders.find(p => p.name.toLowerCase() === defaultDns.toLowerCase());
+            if (selectedProv && !selectedProv.enabled) {
+              return jsonResponse({ error: 'Cannot set a disabled provider as the default resolver! Please enable it first.' }, 400);
+            }
             await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('default_dns', ?)").bind(defaultDns).run();
           }
           if (cfMode !== undefined) {
@@ -829,10 +910,20 @@ export default {
             await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('admin_password_hash', ?)").bind(newHash).run();
           }
           if (providers) {
-            await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('dns_providers', ?)").bind(JSON.stringify(providers)).run();
-            if (env.KV) {
-              await env.KV.put('active_dns_providers', JSON.stringify(providers));
+            // Check if currently configured default DNS is being disabled
+            const defaultDnsRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'default_dns'").first();
+            const defaultDnsName = defaultDnsRow?.value || 'Cloudflare';
+            const defaultProv = providers.find(p => p.name.toLowerCase() === defaultDnsName.toLowerCase());
+            if (defaultProv && !defaultProv.enabled) {
+              return jsonResponse({ error: 'Cannot disable the default resolver! Please set another active provider as the default first.' }, 400);
             }
+            await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('dns_providers', ?)").bind(JSON.stringify(providers)).run();
+          }
+
+          // Invalidate KV Caches
+          if (env.KV) {
+            await env.KV.delete('active_settings_map');
+            await env.KV.delete('active_dns_providers');
           }
 
           return jsonResponse({ success: true });
@@ -2195,17 +2286,35 @@ const ADMIN_HTML = `<!DOCTYPE html>
     // Providers Actions
     async function toggleProviderState(idx) {
       if (!appData) return;
-      appData.providers[idx].enabled = !appData.providers[idx].enabled;
+      const provider = appData.providers[idx];
+      const isCurrentlyDefault = provider.name.toLowerCase() === appData.config.defaultDns.toLowerCase();
+      if (isCurrentlyDefault && provider.enabled) {
+        showAlert('Cannot disable the default resolver! Please set another provider as default first.', 'error');
+        refreshAllData();
+        return;
+      }
+      provider.enabled = !provider.enabled;
       await saveProvidersState();
     }
 
     async function deleteCustomProvider(idx) {
       if (!confirm('Are you sure you want to delete this DNS Provider?')) return;
+      const provider = appData.providers[idx];
+      const isCurrentlyDefault = provider.name.toLowerCase() === appData.config.defaultDns.toLowerCase();
+      if (isCurrentlyDefault) {
+        showAlert('Cannot delete the default resolver! Please set another provider as default first.', 'error');
+        return;
+      }
       appData.providers.splice(idx, 1);
       await saveProvidersState();
     }
 
     async function setDefaultProvider(name) {
+      const provider = appData.providers.find(p => p.name.toLowerCase() === name.toLowerCase());
+      if (provider && !provider.enabled) {
+        showAlert('Cannot set a disabled provider as the default resolver! Please enable it first.', 'error');
+        return;
+      }
       try {
         const res = await fetch('/api/settings', {
           method: 'POST',
@@ -2219,7 +2328,9 @@ const ADMIN_HTML = `<!DOCTYPE html>
           showAlert('Default Upstream DNS configured to ' + name, 'success');
           refreshAllData();
         } else {
-          showAlert('Failed to update default DNS provider', 'error');
+          const data = await res.json();
+          showAlert(data.error || 'Failed to update default DNS provider', 'error');
+          refreshAllData();
         }
       } catch (err) {
         showAlert('Connection failure', 'error');
@@ -2261,7 +2372,9 @@ const ADMIN_HTML = `<!DOCTYPE html>
           showAlert('DNS providers updated successfully', 'success');
           refreshAllData();
         } else {
-          showAlert('Failed to synchronize resolvers', 'error');
+          const data = await res.json();
+          showAlert(data.error || 'Failed to synchronize resolvers', 'error');
+          refreshAllData();
         }
       } catch (err) {
         showAlert('Connection error syncing resolvers', 'error');
