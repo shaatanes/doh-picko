@@ -8,6 +8,17 @@ const ipRequests = new Map();
 const RATE_LIMIT_WINDOW_MS = 60000; // 1 minute
 const MAX_REQUESTS_PER_WINDOW = 300; // Allow ample queries for DNS clients, limit abuse for API
 
+// HIGHLY OPTIMIZED IN-MEMORY CACHES FOR ULTRA-LOW LATENCY / ULTRA-LOW PING (GAMING)
+const userCache = new Map();
+const USER_CACHE_TTL = 30000; // 30 seconds
+
+let inMemorySettings = null;
+let inMemorySettingsTime = 0;
+const SETTINGS_CACHE_TTL = 30000; // 30 seconds
+
+const dnsCache = new Map();
+const DNS_CACHE_TTL = 60000; // 60 seconds (1 minute Cache)
+
 // Default list of built-in DNS Providers
 const DEFAULT_DNS_PROVIDERS = [
   { name: 'Cloudflare', url: 'https://1.1.1.1/dns-query', enabled: true, is_built_in: true },
@@ -347,7 +358,7 @@ export default {
         };
         const token = await signJwt(payload, jwtSecret);
 
-        // Serve with secure cookie + body
+        // Serve with secure token body and cookie
         return new Response(JSON.stringify({ success: true, token }), {
           status: 200,
           headers: {
@@ -399,8 +410,19 @@ export default {
         return new Response("Missing subscriber UUID. Standard DNS queries must contain a valid dns payload.", { status: 400, headers: corsHeaders() });
       }
 
-      // Look up subscription user
-      const user = await env.DB.prepare("SELECT * FROM users WHERE uuid = ?").bind(uuid).first();
+      // Look up subscription user (utilizing ultra-fast in-memory cache to avoid slow DB reads)
+      const now = Date.now();
+      let user = null;
+      const cachedUser = userCache.get(uuid);
+      if (cachedUser && (now - cachedUser.timestamp < USER_CACHE_TTL)) {
+        user = cachedUser.data;
+      } else {
+        user = await env.DB.prepare("SELECT * FROM users WHERE uuid = ?").bind(uuid).first();
+        if (user) {
+          userCache.set(uuid, { data: user, timestamp: now });
+        }
+      }
+
       if (!user) {
         if (isBrowserVisit) {
           return new Response(`<!DOCTYPE html>
@@ -425,26 +447,36 @@ export default {
         return new Response("User not found or invalid UUID.", { status: 403, headers: corsHeaders() });
       }
 
-      // Retrieve all settings in a single fast query (or KV cache)
-      let settingsMap = new Map();
-      const cachedSettingsStr = env.KV ? await env.KV.get('active_settings_map') : null;
-      if (cachedSettingsStr) {
-        try {
-          const cachedArr = JSON.parse(cachedSettingsStr);
-          settingsMap = new Map(cachedArr);
-        } catch (e) {
-          console.error("Failed to parse cached settings:", e);
-        }
-      }
-
-      if (settingsMap.size === 0) {
-        const settingsRows = await env.DB.prepare("SELECT key, value FROM settings").all();
-        if (settingsRows && settingsRows.results) {
-          const arr = settingsRows.results.map(r => [r.key, r.value]);
-          settingsMap = new Map(arr);
-          if (env.KV) {
-            await env.KV.put('active_settings_map', JSON.stringify(arr), { expirationTtl: 60 });
+      // Retrieve all settings in a single fast query (or KV/in-memory cache)
+      let settingsMap = null;
+      if (inMemorySettings && (now - inMemorySettingsTime < SETTINGS_CACHE_TTL)) {
+        settingsMap = inMemorySettings;
+      } else {
+        settingsMap = new Map();
+        const cachedSettingsStr = env.KV ? await env.KV.get('active_settings_map') : null;
+        if (cachedSettingsStr) {
+          try {
+            const cachedArr = JSON.parse(cachedSettingsStr);
+            settingsMap = new Map(cachedArr);
+          } catch (e) {
+            console.error("Failed to parse cached settings:", e);
           }
+        }
+
+        if (settingsMap.size === 0) {
+          const settingsRows = await env.DB.prepare("SELECT key, value FROM settings").all();
+          if (settingsRows && settingsRows.results) {
+            const arr = settingsRows.results.map(r => [r.key, r.value]);
+            settingsMap = new Map(arr);
+            if (env.KV) {
+              await env.KV.put('active_settings_map', JSON.stringify(arr), { expirationTtl: 60 });
+            }
+          }
+        }
+
+        if (settingsMap.size > 0) {
+          inMemorySettings = settingsMap;
+          inMemorySettingsTime = now;
         }
       }
 
@@ -565,63 +597,125 @@ export default {
       }
 
       // Forward DoH Request
-      let dohResponse;
-      try {
-        const requestBody = method === 'POST' ? await request.arrayBuffer() : null;
-        const cache = caches.default;
-        
-        let cacheKey = null;
-        if (isCacheEnabled && method === 'GET') {
-          cacheKey = new Request(targetUrl.toString(), {
-            headers: { 'Accept': 'application/dns-message' }
-          });
-          dohResponse = await cache.match(cacheKey);
-        }
+      let dohResponseBuffer = null;
+      let dohResponseStatus = 200;
+      let dohResponseStatusText = 'OK';
+      let dohResponseHeaders = null;
+      let usedCache = false;
 
-        if (!dohResponse) {
+      let requestBody = null;
+      try {
+        requestBody = method === 'POST' ? await request.arrayBuffer() : null;
+      } catch (err) {
+        console.warn("Failed to parse request body:", err);
+      }
+
+      // Build DNS in-memory cache key
+      let dnsCacheKey = null;
+      if (isCacheEnabled) {
+        const providerKey = targetProvider ? targetProvider.name : 'Unknown';
+        let queryKey = '';
+        if (method === 'GET') {
+          queryKey = url.searchParams.get('dns') || '';
+        } else if (requestBody) {
+          // Fast arrayBuffer to base64 for key hashing
+          let binary = '';
+          const bytes = new Uint8Array(requestBody);
+          const len = Math.min(bytes.byteLength, 1024); // Limit scan for fast hashing
+          for (let i = 0; i < len; i++) {
+            binary += String.fromCharCode(bytes[i]);
+          }
+          queryKey = btoa(binary) + '_' + bytes.byteLength;
+        }
+        dnsCacheKey = `${providerKey}:${queryKey}`;
+      }
+
+      // Check in-memory DNS cache
+      if (isCacheEnabled && dnsCacheKey) {
+        const cachedDns = dnsCache.get(dnsCacheKey);
+        if (cachedDns && (Date.now() - cachedDns.timestamp < DNS_CACHE_TTL)) {
+          dohResponseBuffer = cachedDns.body;
+          dohResponseStatus = cachedDns.status;
+          dohResponseStatusText = cachedDns.statusText;
+          dohResponseHeaders = cachedDns.headers;
+          usedCache = true;
+        }
+      }
+
+      if (!dohResponseBuffer) {
+        try {
           const fetchOptions = {
             method: method,
-            headers: forwardHeaders,
-            cf: {
-              // Cloudflare specific features
-              http3: true
-            }
+            headers: forwardHeaders
           };
           if (method !== 'GET' && method !== 'HEAD' && requestBody) {
             fetchOptions.body = requestBody;
           }
 
-          dohResponse = await fetch(targetUrl.toString(), fetchOptions);
-
-          // Store response in cache if status is OK
-          if (isCacheEnabled && cacheKey && dohResponse.status === 200) {
-            // Clone and sanitize headers to avoid caching compressed header with decompressed body
-            const cacheHeaders = new Headers(dohResponse.headers);
-            cacheHeaders.delete('Content-Encoding');
-            cacheHeaders.delete('Content-Length');
-            cacheHeaders.delete('Transfer-Encoding');
-            cacheHeaders.set('Cache-Control', 'public, max-age=60');
-
-            const cacheResponse = new Response(dohResponse.clone().body, {
-              status: dohResponse.status,
-              statusText: dohResponse.statusText,
-              headers: cacheHeaders
-            });
-            ctx.waitUntil(cache.put(cacheKey, cacheResponse));
+          let dohResponse;
+          try {
+            dohResponse = await fetch(targetUrl.toString(), fetchOptions);
+            if (!dohResponse || dohResponse.status !== 200) {
+              throw new Error(`Upstream returned status ${dohResponse ? dohResponse.status : 'null'}`);
+            }
+          } catch (err) {
+            console.warn(`Upstream DNS ${targetProvider ? targetProvider.name : 'Unknown'} failed, falling back to Google DNS:`, err);
+            
+            // Fallback to Google DNS
+            const fallbackUrl = 'https://8.8.8.8/dns-query';
+            const fallbackOptions = {
+              method: method,
+              headers: forwardHeaders
+            };
+            if (method !== 'GET' && method !== 'HEAD' && requestBody) {
+              fallbackOptions.body = requestBody;
+            }
+            dohResponse = await fetch(fallbackUrl, fallbackOptions);
           }
+
+          if (dohResponse) {
+            dohResponseStatus = dohResponse.status;
+            dohResponseStatusText = dohResponse.statusText;
+            dohResponseHeaders = {};
+            for (const [k, v] of dohResponse.headers.entries()) {
+              dohResponseHeaders[k] = v;
+            }
+            dohResponseBuffer = await dohResponse.arrayBuffer();
+
+            // Store in in-memory DNS cache
+            if (isCacheEnabled && dnsCacheKey && dohResponseStatus === 200) {
+              dnsCache.set(dnsCacheKey, {
+                body: dohResponseBuffer,
+                status: dohResponseStatus,
+                statusText: dohResponseStatusText,
+                headers: dohResponseHeaders,
+                timestamp: Date.now()
+              });
+            }
+          }
+        } catch (err) {
+          return new Response(`Upstream DoH Forwarding Failed: ${err.message}`, { status: 502, headers: corsHeaders() });
         }
-      } catch (err) {
-        return new Response(`Upstream DoH Forwarding Failed: ${err.message}`, { status: 502, headers: corsHeaders() });
       }
 
       // SUCCESSFUL REQUEST: Increment Counters and Log activity
-      if (dohResponse.status === 200) {
+      if (dohResponseStatus === 200) {
         const updatedQueryCount = user.query_count + 1;
         const updatedUsedGb = updatedQueryCount / queriesPerGb;
         const updatedRemainingGb = user.traffic_limit_gb - updatedUsedGb;
         const isoNow = new Date().toISOString();
 
-        // Transactional-style DB updates
+        // Update in-memory user cache with the updated data so we don't serve stale stats from cache
+        const updatedUserData = {
+          ...user,
+          query_count: updatedQueryCount,
+          used_gb: updatedUsedGb,
+          remaining_gb: updatedRemainingGb,
+          last_activity: isoNow
+        };
+        userCache.set(uuid, { data: updatedUserData, timestamp: Date.now() });
+
+        // Transactional-style DB updates (Fully asynchronous, non-blocking)
         ctx.waitUntil((async () => {
           try {
             await env.DB.prepare(`
@@ -642,15 +736,21 @@ export default {
 
       // Return DNS message response with correct binary headers
       // We clean headers to prevent transfer/compression/length decoding issues on the client side
-      const responseHeaders = new Headers(dohResponse.headers);
-      responseHeaders.delete('Content-Encoding');
-      responseHeaders.delete('Content-Length');
-      responseHeaders.delete('Transfer-Encoding');
+      const responseHeaders = new Headers();
+      if (dohResponseHeaders) {
+        for (const [k, v] of Object.entries(dohResponseHeaders)) {
+          const lowerK = k.toLowerCase();
+          if (lowerK !== 'content-encoding' && lowerK !== 'content-length' && lowerK !== 'transfer-encoding') {
+            responseHeaders.set(k, v);
+          }
+        }
+      }
       responseHeaders.set('Access-Control-Allow-Origin', '*');
+      responseHeaders.set('X-Cache', usedCache ? 'HIT' : 'MISS');
 
-      const clientResponse = new Response(dohResponse.body, {
-        status: dohResponse.status,
-        statusText: dohResponse.statusText,
+      const clientResponse = new Response(dohResponseBuffer, {
+        status: dohResponseStatus,
+        statusText: dohResponseStatusText,
         headers: responseHeaders
       });
       return clientResponse;
@@ -1971,10 +2071,7 @@ const ADMIN_HTML = `<!DOCTYPE html>
 
           const formattedExpiry = u.expire_at ? new Date(u.expire_at).toLocaleString() : 'Lifetime';
 
-          let host = window.location.host;
-          if (host.includes('localhost') || host.includes('run.app') || host.includes('aistudio')) {
-            host = 'doh-picko.g6812626.workers.dev';
-          }
+          const host = window.location.host;
           const dohLink = 'https://' + host + '/dns-query/' + u.uuid;
 
           const tr = document.createElement('tr');
