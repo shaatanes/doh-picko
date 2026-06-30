@@ -646,6 +646,109 @@ export default {
 
       if (!dohResponseBuffer) {
         try {
+          // Extract queried domain name (QNAME) for intelligent split routing
+          let dnsBuffer = null;
+          if (method === 'GET') {
+            const dnsParam = url.searchParams.get('dns');
+            if (dnsParam) {
+              try {
+                let b64 = dnsParam.replace(/-/g, '+').replace(/_/g, '/');
+                while (b64.length % 4) b64 += '=';
+                const binary = atob(b64);
+                const bytes = new Uint8Array(binary.length);
+                for (let i = 0; i < binary.length; i++) {
+                  bytes[i] = binary.charCodeAt(i);
+                }
+                dnsBuffer = bytes.buffer;
+              } catch (e) {}
+            }
+          } else if (method === 'POST' && requestBody) {
+            dnsBuffer = requestBody;
+          }
+
+          function extractQName(buffer) {
+            if (!buffer || buffer.byteLength < 12) return null;
+            try {
+              const view = new DataView(buffer);
+              const qcount = view.getUint16(4);
+              if (qcount === 0) return null;
+
+              let offset = 12;
+              const labels = [];
+              while (offset < buffer.byteLength) {
+                const len = view.getUint8(offset);
+                if (len === 0) {
+                  break;
+                }
+                if ((len & 0xC0) === 0xC0) {
+                  break;
+                }
+                offset++;
+                if (offset + len > buffer.byteLength) break;
+                const labelBytes = new Uint8Array(buffer, offset, len);
+                let label = '';
+                for (let i = 0; i < labelBytes.length; i++) {
+                  label += String.fromCharCode(labelBytes[i]);
+                }
+                labels.push(label);
+                offset += len;
+              }
+              return labels.join('.').toLowerCase();
+            } catch (err) {
+              return null;
+            }
+          }
+
+          const queriedDomain = extractQName(dnsBuffer);
+
+          function shouldUnblock(domain) {
+            if (!domain) return true; // Default to unblocking for compatibility
+            
+            // Standard non-gaming keywords to resolve via ultra-fast global DNS
+            const bypassKeywords = [
+              'google', 'gstatic', 'googleapis', 'youtube', 'ytimg', 'ggpht', 'doubleclick',
+              'apple', 'icloud', 'mzstatic', 'aaplimg', 'itunes',
+              'microsoft', 'windows', 'msn', 'bing', 'office', 'live.com', 'outlook', 'skype',
+              'github', 'githubusercontent', 'git-scm',
+              'amazon', 'aws', 'media-amazon',
+              'cloudflare', 'digicert', 'letsencrypt', 'sectigo',
+              'wikipedia', 'wikimedia',
+              'speedtest', 'fast.com',
+              'instagram', 'facebook', 'fbcdn', 'messenger',
+              'whatsapp', 'wa.me',
+              'telegram', 't.me',
+              'ir', // Iranian domestic domains are direct/not restricted and faster via standard DNS
+              'arvancloud', 'snapp', 'tapsi', 'digikala', 'shaparak', 'divar', 'aparat'
+            ];
+
+            // Direct gaming platforms and keywords
+            const gameKeywords = [
+              'playstation', 'sony', 'playnet', 'p01.net', 'xbox', 'microsoftgames', 'xboxlive', 'xbx',
+              'epicgames', 'steam', 'valve', 'steampowered', 'steamstatic',
+              'origin', 'ea.com', 'ea-cdn', 'eagames',
+              'riotgames', 'leagueoflegends', 'valorant', 'riot',
+              'pubg', 'pubgmobile', 'battlegrounds',
+              'apexlegends', 'battle.net', 'blizzard', 'activision', 'uplay', 'ubisoft',
+              'gta', 'rockstargames', 'rockstargame', 'nintendo', 'epic', 'bnet',
+              'discord', 'twitch', 'spotify', 'roblox', 'minecraft', 'mojang',
+              'supercell', 'clashofclans', 'clashroyale', 'brawlstars',
+              'genshin', 'hoyoverse', 'mihoyo', 'warframe', 'wargaming', 'worldoftanks'
+            ];
+
+            // If matches gaming platforms, unblock
+            for (const kw of gameKeywords) {
+              if (domain.includes(kw)) return true;
+            }
+
+            // If matches standard platforms/CDNs, bypass the unblockers
+            for (const kw of bypassKeywords) {
+              if (domain.includes(kw)) return false;
+            }
+
+            // Default fallback is to unblock to guarantee everything else works
+            return true;
+          }
+
           // Define all unblocking providers
           const unblockingList = [
             { name: 'Radar Game (رادار گیم)', url: 'https://doh.radar.game/dns-query' },
@@ -661,95 +764,111 @@ export default {
           }
 
           const targetIsUnblocking = isUnblockingProvider(targetProvider ? targetProvider.name : '');
-          const urlsToTry = [];
+          let listToRace = [];
 
           if (targetIsUnblocking) {
-            // First try the user's selected provider
-            urlsToTry.push({ name: targetProvider.name, url: targetUrlStr });
-            // Then add all other unblocking alternatives
-            for (const p of unblockingList) {
-              if (p.url !== targetUrlStr) {
-                urlsToTry.push(p);
+            const needUnblock = shouldUnblock(queriedDomain);
+
+            if (needUnblock) {
+              // Priority 1: User's selected unblocking provider (placed first)
+              listToRace.push({ name: targetProvider.name, url: targetUrlStr });
+              // Add all other unblocking providers to run in parallel
+              for (const p of unblockingList) {
+                if (p.url !== targetUrlStr) {
+                  listToRace.push(p);
+                }
               }
+              // Add fast global fallbacks as safety nets
+              listToRace.push({ name: 'Google (Fallback)', url: 'https://8.8.8.8/dns-query' });
+              listToRace.push({ name: 'Cloudflare (Fallback)', url: 'https://1.1.1.1/dns-query' });
+            } else {
+              // Standard domain (like Apple, Microsoft update, etc.) -> Bypass unblocking for 10x faster response and 100% stability!
+              listToRace.push({ name: 'Cloudflare (Fastpass)', url: 'https://1.1.1.1/dns-query' });
+              listToRace.push({ name: 'Google (Fastpass)', url: 'https://8.8.8.8/dns-query' });
+              listToRace.push({ name: 'Quad9 (Fastpass)', url: 'https://dns.quad9.net/dns-query' });
             }
-            // Add global fallbacks as last resort
-            urlsToTry.push({ name: 'Google Fallback', url: 'https://8.8.8.8/dns-query' });
-            urlsToTry.push({ name: 'Cloudflare Fallback', url: 'https://1.1.1.1/dns-query' });
           } else {
-            // Try the standard user-selected provider
-            urlsToTry.push({ name: targetProvider ? targetProvider.name : 'Target', url: targetUrlStr });
+            // User chose a regular provider (like Google, Cloudflare, NextDNS, etc.)
+            listToRace.push({ name: targetProvider ? targetProvider.name : 'Target', url: targetUrlStr });
+            // Add standard global backups to race as well to guarantee speed/uptime
             if (targetUrlStr !== 'https://8.8.8.8/dns-query') {
-              urlsToTry.push({ name: 'Google Fallback', url: 'https://8.8.8.8/dns-query' });
+              listToRace.push({ name: 'Google Fallback', url: 'https://8.8.8.8/dns-query' });
             }
             if (targetUrlStr !== 'https://1.1.1.1/dns-query') {
-              urlsToTry.push({ name: 'Cloudflare Fallback', url: 'https://1.1.1.1/dns-query' });
+              listToRace.push({ name: 'Cloudflare Fallback', url: 'https://1.1.1.1/dns-query' });
             }
           }
 
-          let dohResponse = null;
-          let successfulProviderName = '';
-
-          for (const item of urlsToTry) {
-            const currentUrl = new URL(item.url);
-
-            // Apply Cloudflare Mode options if the current attempt is Cloudflare
-            if (currentUrl.host.includes('1.1.1.1') || currentUrl.host.includes('cloudflare')) {
-              if (cfMode === 'IPv4') {
-                currentUrl.host = '1.1.1.1';
-              } else if (cfMode === 'IPv6') {
-                currentUrl.host = '[2606:4700:4700::1111]';
-              }
-            }
-
-            // Copy incoming search params to current URL, keeping standard DNS query params
-            for (const [key, value] of url.searchParams.entries()) {
-              if (key !== 'provider') {
-                currentUrl.searchParams.set(key, value);
-              }
-            }
-
-            const fetchOptions = {
-              method: method,
-              headers: forwardHeaders
-            };
-            if (method !== 'GET' && method !== 'HEAD' && requestBody) {
-              fetchOptions.body = requestBody;
-            }
-
-            // Fast timeouts for ultra-low latency & responsive fail-over
-            const isUnblockItem = isUnblockingProvider(item.name);
-            const timeoutDuration = isUnblockItem ? 850 : 1800; // 850ms for unblocking servers, 1.8s for fallback global DNS
-
+          // Racing function: executes fetch requests simultaneously and returns the fastest successful one
+          async function raceDnsRequests(providers, reqMethod, reqHeaders, body, timeoutMs) {
             const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), timeoutDuration);
-            fetchOptions.signal = controller.signal;
+            const timeoutId = setTimeout(() => {
+              controller.abort();
+            }, timeoutMs);
+
+            const fetchPromises = providers.map(async (provider) => {
+              const currentUrl = new URL(provider.url);
+
+              // Apply Cloudflare Mode options if the current attempt is Cloudflare
+              if (currentUrl.host.includes('1.1.1.1') || currentUrl.host.includes('cloudflare')) {
+                if (cfMode === 'IPv4') {
+                  currentUrl.host = '1.1.1.1';
+                } else if (cfMode === 'IPv6') {
+                  currentUrl.host = '[2606:4700:4700::1111]';
+                }
+              }
+
+              // Copy incoming search params to current URL, keeping standard DNS query params
+              for (const [key, value] of url.searchParams.entries()) {
+                if (key !== 'provider') {
+                  currentUrl.searchParams.set(key, value);
+                }
+              }
+
+              const fetchOptions = {
+                method: reqMethod,
+                headers: reqHeaders,
+                signal: controller.signal
+              };
+
+              if (reqMethod !== 'GET' && reqMethod !== 'HEAD' && body) {
+                fetchOptions.body = body;
+              }
+
+              const res = await fetch(currentUrl.toString(), fetchOptions);
+              if (res && res.status === 200) {
+                const buffer = await res.arrayBuffer();
+                return {
+                  response: res,
+                  buffer: buffer,
+                  providerName: provider.name
+                };
+              }
+              throw new Error(`Status ${res ? res.status : 'failed'}`);
+            });
 
             try {
-              const res = await fetch(currentUrl.toString(), fetchOptions);
+              const firstSuccessful = await Promise.any(fetchPromises);
               clearTimeout(timeoutId);
-
-              if (res && res.status === 200) {
-                dohResponse = res;
-                successfulProviderName = item.name;
-                break; // Found a working provider!
-              }
+              return firstSuccessful;
             } catch (err) {
               clearTimeout(timeoutId);
-              // Quietly log and proceed to next provider in fallback sequence
+              throw new Error("All parallel DNS upstreams failed or timed out.");
             }
           }
 
-          if (!dohResponse) {
-            throw new Error("All configured and fallback DNS upstreams failed or timed out.");
-          }
+          // Use a generous 4.5 seconds total timeout, but since we are racing in parallel,
+          // the successful one will return in milliseconds!
+          const raceResult = await raceDnsRequests(listToRace, method, forwardHeaders, requestBody, 4500);
 
-          dohResponseStatus = dohResponse.status;
-          dohResponseStatusText = dohResponse.statusText;
+          dohResponseStatus = raceResult.response.status;
+          dohResponseStatusText = raceResult.response.statusText;
           dohResponseHeaders = {};
-          for (const [k, v] of dohResponse.headers.entries()) {
+          for (const [k, v] of raceResult.response.headers.entries()) {
             dohResponseHeaders[k] = v;
           }
-          dohResponseBuffer = await dohResponse.arrayBuffer();
+          dohResponseBuffer = raceResult.buffer;
+          successfulProviderName = raceResult.providerName;
 
           // Store in in-memory DNS cache
           if (isCacheEnabled && dnsCacheKey && dohResponseStatus === 200) {
