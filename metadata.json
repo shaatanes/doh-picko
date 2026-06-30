@@ -1,0 +1,6 @@
+{
+  "name": "DoH Subscription System",
+  "description": "A comprehensive Cloudflare Workers-based DNS over HTTPS (DoH) subscription system featuring traffic accounting, custom DNS providers, and a responsive Admin Dashboard.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

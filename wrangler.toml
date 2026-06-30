@@ -1,0 +1,17 @@
+name = "doh-subscription-worker"
+main = "worker.js"
+compatibility_date = "2024-03-03"
+
+[vars]
+# You can define global variables here if needed
+NODE_ENV = "production"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "doh_subscription_db"
+database_id = "YOUR_D1_DATABASE_ID_HERE" # Put your D1 database UUID here
+migrations_dir = "migrations"
+
+[[kv_namespaces]]
+binding = "KV"
+id = "YOUR_KV_NAMESPACE_ID_HERE" # Put your KV namespace ID here
