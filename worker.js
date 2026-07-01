@@ -55,7 +55,8 @@ CREATE TABLE IF NOT EXISTS users (
   used_gb REAL DEFAULT 0.0,
   remaining_gb REAL,
   enabled INTEGER DEFAULT 1,
-  last_activity TEXT
+  last_activity TEXT,
+  dns_provider TEXT
 );
 
 CREATE TABLE IF NOT EXISTS traffic_logs (
@@ -188,6 +189,13 @@ async function initDb(db, env) {
   const statements = SCHEMA_SQL.trim().split(';').filter(s => s.trim().length > 0);
   for (const stmt of statements) {
     await db.prepare(stmt).run();
+  }
+
+  // Dynamic schema migrations: Add dns_provider column to users table if it does not exist
+  try {
+    await db.prepare("ALTER TABLE users ADD COLUMN dns_provider TEXT").run();
+  } catch (err) {
+    // Column already exists or table is empty/created freshly
   }
 
   // Check if admin password hash is configured
@@ -496,9 +504,33 @@ export default {
         providers = DEFAULT_DNS_PROVIDERS;
       }
 
+      let defaultDnsName = settingsMap.get('default_dns') || 'Cloudflare';
+
+      // Handle user's self-selected provider update from the subscriber dashboard page (POST with JSON)
+      if (method === 'POST' && request.headers.get('Content-Type')?.includes('application/json')) {
+        try {
+          const { provider } = await request.json();
+          // Check if provider is empty (reset to system default) or a valid enabled provider
+          if (provider) {
+            const exists = providers.find(p => p.name.toLowerCase() === provider.toLowerCase() && p.enabled);
+            if (!exists) {
+              return jsonResponse({ error: "Selected DNS provider is invalid or currently disabled." }, 400);
+            }
+          }
+          
+          await env.DB.prepare("UPDATE users SET dns_provider = ? WHERE uuid = ?").bind(provider || null, uuid).run();
+          userCache.delete(uuid); // Clear cache so the next queries pick up the change immediately
+          dnsCache.clear(); // Clear DNS cache so the change is applied instantly
+          
+          return jsonResponse({ success: true, message: "Upstream DNS resolver updated successfully." });
+        } catch (e) {
+          return jsonResponse({ error: `Failed to update provider choice: ${e.message}` }, 500);
+        }
+      }
+
       // If this is a browser visit (GET request and no 'dns' query param), serve the beautiful dashboard page!
       if (isBrowserVisit) {
-        return new Response(getSubscriberPageHTML(user, url.host, providers), {
+        return new Response(getSubscriberPageHTML(user, url.host, providers, defaultDnsName), {
           status: 200,
           headers: {
             'Content-Type': 'text/html; charset=utf-8',
@@ -542,7 +574,7 @@ export default {
 
       // Load other parameters
       const queriesPerGb = parseInt(settingsMap.get('queries_per_gb') || '5000', 10);
-      const defaultDnsName = settingsMap.get('default_dns') || 'Cloudflare';
+      defaultDnsName = settingsMap.get('default_dns') || 'Cloudflare';
       const cfMode = settingsMap.get('cloudflare_mode') || 'Automatic';
       const customUa = settingsMap.get('custom_user_agent') || '';
       const isCacheEnabled = settingsMap.get('dns_cache_enabled') === 'true';
@@ -553,6 +585,9 @@ export default {
       if (providers && providers.length > 0) {
         if (customProvider) {
           targetProvider = providers.find(p => p.enabled && p.name.toLowerCase() === customProvider.toLowerCase());
+        }
+        if (!targetProvider && user.dns_provider) {
+          targetProvider = providers.find(p => p.enabled && p.name.toLowerCase() === user.dns_provider.toLowerCase());
         }
         if (!targetProvider) {
           // Fallback to default setting
@@ -703,121 +738,42 @@ export default {
 
           const queriedDomain = extractQName(dnsBuffer);
 
-          // Define all available resolvers
-          const unblockingList = [
-            { name: 'Radar Game (رادار گیم)', url: 'https://doh.radar.game/dns-query' },
-            { name: 'Electro DNS (الکترو)', url: 'https://doh.electro.ir/dns-query' },
-            { name: '403 Online (۴۰۳ آنلاین)', url: 'https://dns.403.online/dns-query' },
-            { name: 'Shecan (شکن)', url: 'https://free.shecan.ir/dns-query' }
-          ];
-
-          const globalList = [
-            { name: 'Cloudflare', url: 'https://1.1.1.1/dns-query' },
-            { name: 'Google', url: 'https://8.8.8.8/dns-query' },
-            { name: 'Quad9', url: 'https://dns.quad9.net/dns-query' }
-          ];
-
-          // Construct the parallel race list to dynamically find the fastest route
-          const rawRaceList = [];
-          
-          // 1. Primary selected provider goes first
-          if (targetProvider) {
-            rawRaceList.push({ name: targetProvider.name, url: targetUrlStr });
-          }
-
-          // 2. Add unblocking providers
-          for (const p of unblockingList) {
-            rawRaceList.push(p);
-          }
-
-          // 3. Add global resolvers
-          for (const g of globalList) {
-            rawRaceList.push(g);
-          }
-
-          // Deduplicate the list to avoid double querying the same endpoint
-          const seenUrls = new Set();
-          const listToRace = [];
-          for (const item of rawRaceList) {
-            if (!seenUrls.has(item.url)) {
-              seenUrls.add(item.url);
-              listToRace.push(item);
+          let res;
+          try {
+            const fetchOptions = {
+              method,
+              headers: forwardHeaders,
+            };
+            if (method !== 'GET' && method !== 'HEAD' && requestBody) {
+              fetchOptions.body = requestBody.slice(0);
             }
-          }
-
-          // Racing function: executes fetch requests simultaneously and returns the fastest successful one
-          async function raceDnsRequests(providers, reqMethod, reqHeaders, body, timeoutMs) {
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => {
-              controller.abort();
-            }, timeoutMs);
-
-            const fetchPromises = providers.map(async (provider) => {
-              const currentUrl = new URL(provider.url);
-
-              // Apply Cloudflare Mode options if the current attempt is Cloudflare
-              if (currentUrl.host.includes('1.1.1.1') || currentUrl.host.includes('cloudflare')) {
-                if (cfMode === 'IPv4') {
-                  currentUrl.host = '1.1.1.1';
-                } else if (cfMode === 'IPv6') {
-                  currentUrl.host = '[2606:4700:4700::1111]';
-                }
-              }
-
-              // Copy incoming search params to current URL, keeping standard DNS query params
-              for (const [key, value] of url.searchParams.entries()) {
-                if (key !== 'provider') {
-                  currentUrl.searchParams.set(key, value);
-                }
-              }
-
-              // Clone headers to prevent shared mutations in parallel fetch requests
-              const headersCopy = new Headers(reqHeaders);
-
-              const fetchOptions = {
-                method: reqMethod,
-                headers: headersCopy,
-                signal: controller.signal
-              };
-
-              // Clone body buffer for POST requests to prevent ArrayBuffer detachment in V8/Node.js parallel fetches
-              if (reqMethod !== 'GET' && reqMethod !== 'HEAD' && body) {
-                fetchOptions.body = body.slice(0);
-              }
-
-              const res = await fetch(currentUrl.toString(), fetchOptions);
-              if (res && res.status === 200) {
-                const buffer = await res.arrayBuffer();
-                return {
-                  response: res,
-                  buffer: buffer,
-                  providerName: provider.name
-                };
-              }
-              throw new Error(`Status ${res ? res.status : 'failed'}`);
-            });
-
-            try {
-              const firstSuccessful = await Promise.any(fetchPromises);
-              clearTimeout(timeoutId);
-              return firstSuccessful;
-            } catch (err) {
-              clearTimeout(timeoutId);
-              throw new Error("All parallel DNS upstreams failed or timed out.");
+            res = await fetch(targetUrl.toString(), fetchOptions);
+            
+            if (!res.ok) {
+              throw new Error(`Upstream returned status ${res.status}`);
             }
+          } catch (err) {
+            console.error(`Primary DNS provider ${winningProviderName} failed, attempting fallback:`, err);
+            // Fall back to Cloudflare
+            winningProviderName = 'Cloudflare (Fallback)';
+            const fallbackUrl = 'https://1.1.1.1/dns-query';
+            const fetchOptions = {
+              method,
+              headers: forwardHeaders,
+            };
+            if (method !== 'GET' && method !== 'HEAD' && requestBody) {
+              fetchOptions.body = requestBody.slice(0);
+            }
+            res = await fetch(fallbackUrl, fetchOptions);
           }
 
-          // Use a generous 4.5 seconds total timeout. The successful one will return in milliseconds!
-          const raceResult = await raceDnsRequests(listToRace, method, forwardHeaders, requestBody, 4500);
-
-          dohResponseStatus = raceResult.response.status;
-          dohResponseStatusText = raceResult.response.statusText;
+          dohResponseStatus = res.status;
+          dohResponseStatusText = res.statusText;
           dohResponseHeaders = {};
-          for (const [k, v] of raceResult.response.headers.entries()) {
+          for (const [k, v] of res.headers.entries()) {
             dohResponseHeaders[k] = v;
           }
-          dohResponseBuffer = raceResult.buffer;
-          winningProviderName = raceResult.providerName;
+          dohResponseBuffer = await res.arrayBuffer();
 
           // Store in in-memory DNS cache
           if (isCacheEnabled && dnsCacheKey && dohResponseStatus === 200) {
@@ -981,7 +937,7 @@ export default {
       if (method === 'PUT' && userEditMatch) {
         const uuid = userEditMatch[1];
         try {
-          const { username, traffic_limit_gb, expire_at, enabled } = await request.json();
+          const { username, traffic_limit_gb, expire_at, enabled, dns_provider } = await request.json();
           
           const currentUser = await env.DB.prepare("SELECT * FROM users WHERE uuid = ?").bind(uuid).first();
           if (!currentUser) {
@@ -992,14 +948,18 @@ export default {
           const nextLimit = traffic_limit_gb !== undefined ? parseFloat(traffic_limit_gb) : currentUser.traffic_limit_gb;
           const nextExpiry = expire_at !== undefined ? (expire_at ? new Date(expire_at).toISOString() : null) : currentUser.expire_at;
           const nextEnabled = enabled !== undefined ? (enabled ? 1 : 0) : currentUser.enabled;
+          const nextDnsProvider = dns_provider !== undefined ? (dns_provider || null) : currentUser.dns_provider;
 
           const nextRemaining = nextLimit - currentUser.used_gb;
 
           await env.DB.prepare(`
             UPDATE users
-            SET username = ?, traffic_limit_gb = ?, expire_at = ?, enabled = ?, remaining_gb = ?
+            SET username = ?, traffic_limit_gb = ?, expire_at = ?, enabled = ?, remaining_gb = ?, dns_provider = ?
             WHERE uuid = ?
-          `).bind(nextUsername, nextLimit, nextExpiry, nextEnabled, nextRemaining, uuid).run();
+          `).bind(nextUsername, nextLimit, nextExpiry, nextEnabled, nextRemaining, nextDnsProvider, uuid).run();
+
+          userCache.delete(uuid); // Clear user cache so changes are immediate
+          dnsCache.clear(); // Clear DNS cache so the updated resolver is used immediately
 
           return jsonResponse({ success: true });
         } catch (e) {
@@ -1184,6 +1144,11 @@ export default {
             await env.KV.delete('active_settings_map');
             await env.KV.delete('active_dns_providers');
           }
+
+          // Clear local in-memory caches immediately
+          inMemorySettings = null;
+          inMemorySettingsTime = 0;
+          dnsCache.clear();
 
           return jsonResponse({ success: true });
         } catch (e) {
@@ -1646,6 +1611,7 @@ const ADMIN_HTML = `<!DOCTYPE html>
                     <th class="p-4">UUID Key</th>
                     <th class="p-4">DoH Connection (Intra)</th>
                     <th class="p-4">Status</th>
+                    <th class="p-4">Upstream DNS</th>
                     <th class="p-4">Limit (GB)</th>
                     <th class="p-4">Used (GB)</th>
                     <th class="p-4">Queries</th>
@@ -1851,6 +1817,12 @@ const ADMIN_HTML = `<!DOCTYPE html>
           <label class="block text-xs font-semibold mb-1 uppercase tracking-wider text-slate-400">Expiration Date (Optional)</label>
           <input type="datetime-local" id="create-expiry" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 text-sm focus:outline-none">
         </div>
+        <div>
+          <label class="block text-xs font-semibold mb-1 uppercase tracking-wider text-slate-400">DNS Provider</label>
+          <select id="create-provider" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 text-sm focus:outline-none">
+            <option value="">System Default</option>
+          </select>
+        </div>
         <button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 rounded-xl transition mt-2">Create Account</button>
       </form>
     </div>
@@ -1876,6 +1848,12 @@ const ADMIN_HTML = `<!DOCTYPE html>
         <div>
           <label class="block text-xs font-semibold mb-1 uppercase tracking-wider text-slate-400">Expiration Date</label>
           <input type="datetime-local" id="edit-expiry" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 text-sm focus:outline-none">
+        </div>
+        <div>
+          <label class="block text-xs font-semibold mb-1 uppercase tracking-wider text-slate-400">DNS Provider</label>
+          <select id="edit-provider" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 text-sm focus:outline-none">
+            <option value="">System Default</option>
+          </select>
         </div>
         <div>
           <label class="block text-xs font-semibold mb-1 uppercase tracking-wider text-slate-400">Status</label>
@@ -2075,6 +2053,7 @@ const ADMIN_HTML = `<!DOCTYPE html>
         updateProvidersTab();
         updateLogsTab();
         updateSettingsTab();
+        populateUserProviderDropdowns();
         updateCharts();
 
         // If on user page, trigger fetch users too
@@ -2224,12 +2203,17 @@ const ADMIN_HTML = `<!DOCTYPE html>
               </div>
             </td>
             <td class="p-4">\${statusBadge}</td>
+            <td class="p-4">
+              <span class="px-2 py-1 rounded-md text-xs font-semibold bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200/50 dark:border-slate-700/50">
+                \${u.dns_provider ? u.dns_provider : 'System Default'}
+              </span>
+            </td>
             <td class="p-4 font-mono text-xs font-medium">\${u.traffic_limit_gb.toFixed(1)} GB</td>
             <td class="p-4 font-mono text-xs text-slate-500">\${u.used_gb.toFixed(4)} GB</td>
             <td class="p-4 font-mono text-xs">\${u.query_count.toLocaleString()}</td>
             <td class="p-4 text-xs text-slate-500">\${formattedExpiry}</td>
             <td class="p-4 text-right flex justify-end gap-1.5">
-              <button onclick="editUserModal('\${u.uuid}', '\${u.username}', \${u.traffic_limit_gb}, '\${u.expire_at || ""}', \${u.enabled})" class="p-1.5 text-blue-500 hover:bg-blue-500/10 rounded-lg transition" title="Edit Subscription"><i data-lucide="edit" class="w-4.5 h-4.5"></i></button>
+              <button onclick="editUserModal('\${u.uuid}', '\${u.username}', \${u.traffic_limit_gb}, '\${u.expire_at || ""}', \${u.enabled}, '\${u.dns_provider || ""}')" class="p-1.5 text-blue-500 hover:bg-blue-500/10 rounded-lg transition" title="Edit Subscription"><i data-lucide="edit" class="w-4.5 h-4.5"></i></button>
               <button onclick="resetUserTraffic('\${u.uuid}')" class="p-1.5 text-amber-500 hover:bg-amber-500/10 rounded-lg transition" title="Reset Traffic Consumption"><i data-lucide="refresh-cw" class="w-4.5 h-4.5"></i></button>
               <button onclick="deleteUser('\${u.uuid}')" class="p-1.5 text-red-500 hover:bg-red-500/10 rounded-lg transition" title="Delete Subscription"><i data-lucide="trash-2" class="w-4.5 h-4.5"></i></button>
             </td>
@@ -2418,8 +2402,32 @@ const ADMIN_HTML = `<!DOCTYPE html>
       }
     }
 
+    function populateUserProviderDropdowns() {
+      if (!appData || !appData.providers) return;
+      const createSelect = document.getElementById('create-provider');
+      const editSelect = document.getElementById('edit-provider');
+      if (!createSelect || !editSelect) return;
+
+      const createVal = createSelect.value;
+      const editVal = editSelect.value;
+
+      const enabledProviders = appData.providers.filter(p => p.enabled);
+
+      let optionsHtml = '<option value="">System Default</option>';
+      enabledProviders.forEach(p => {
+        optionsHtml += \`<option value="\${p.name}">\${p.name}</option>\`;
+      });
+
+      createSelect.innerHTML = optionsHtml;
+      editSelect.innerHTML = optionsHtml;
+
+      createSelect.value = createVal;
+      editSelect.value = editVal;
+    }
+
     // Users CRUD
     function openCreateUserModal() {
+      populateUserProviderDropdowns();
       document.getElementById('modal-create-user').style.display = 'flex';
     }
 
@@ -2428,6 +2436,7 @@ const ADMIN_HTML = `<!DOCTYPE html>
       const username = document.getElementById('create-username').value;
       const traffic_limit_gb = document.getElementById('create-limit').value;
       const expire_at = document.getElementById('create-expiry').value;
+      const dns_provider = document.getElementById('create-provider').value;
 
       try {
         const res = await fetch('/api/users', {
@@ -2436,7 +2445,7 @@ const ADMIN_HTML = `<!DOCTYPE html>
             'Content-Type': 'application/json',
             'Authorization': 'Bearer ' + sessionToken
           },
-          body: JSON.stringify({ username, traffic_limit_gb, expire_at })
+          body: JSON.stringify({ username, traffic_limit_gb, expire_at, dns_provider })
         });
         
         if (res.ok) {
@@ -2453,7 +2462,8 @@ const ADMIN_HTML = `<!DOCTYPE html>
       }
     }
 
-    function editUserModal(uuid, name, limit, expiry, enabled) {
+    function editUserModal(uuid, name, limit, expiry, enabled, dnsProvider) {
+      populateUserProviderDropdowns();
       document.getElementById('edit-uuid').value = uuid;
       document.getElementById('edit-username').value = name;
       document.getElementById('edit-limit').value = limit;
@@ -2468,6 +2478,7 @@ const ADMIN_HTML = `<!DOCTYPE html>
         document.getElementById('edit-expiry').value = '';
       }
       
+      document.getElementById('edit-provider').value = dnsProvider || '';
       document.getElementById('edit-enabled').value = enabled;
       document.getElementById('modal-edit-user').style.display = 'flex';
     }
@@ -2478,6 +2489,7 @@ const ADMIN_HTML = `<!DOCTYPE html>
       const username = document.getElementById('edit-username').value;
       const traffic_limit_gb = document.getElementById('edit-limit').value;
       const expire_at = document.getElementById('edit-expiry').value;
+      const dns_provider = document.getElementById('edit-provider').value;
       const enabled = document.getElementById('edit-enabled').value === '1';
 
       try {
@@ -2487,7 +2499,7 @@ const ADMIN_HTML = `<!DOCTYPE html>
             'Content-Type': 'application/json',
             'Authorization': 'Bearer ' + sessionToken
           },
-          body: JSON.stringify({ username, traffic_limit_gb, expire_at, enabled })
+          body: JSON.stringify({ username, traffic_limit_gb, expire_at, enabled, dns_provider })
         });
 
         if (res.ok) {
@@ -2780,7 +2792,7 @@ const ADMIN_HTML = `<!DOCTYPE html>
 </html>
 `;
 
-function getSubscriberPageHTML(user, host, providers) {
+function getSubscriberPageHTML(user, host, providers, defaultDnsName) {
   // Determine user status
   let status = 'ACTIVE';
   let statusColor = 'text-emerald-500 bg-emerald-500/10 border-emerald-500/20';
@@ -2816,7 +2828,7 @@ function getSubscriberPageHTML(user, host, providers) {
 
   // Format providers to show only enabled ones
   const enabledProviders = providers.filter(p => p.enabled);
-  const defaultProvider = enabledProviders[0]?.name || 'Cloudflare';
+  const activeProvider = user.dns_provider || defaultDnsName || 'Cloudflare';
 
   return `<!DOCTYPE html>
 <html lang="en" class="dark">
@@ -2960,10 +2972,16 @@ function getSubscriberPageHTML(user, host, providers) {
 
         <!-- DNS Resolver Dropdown -->
         <div class="space-y-2">
-          <label class="text-xs font-semibold text-slate-300 block">Upstream DNS Resolver</label>
+          <div class="flex justify-between items-center">
+            <label class="text-xs font-semibold text-slate-300 block">Upstream DNS Resolver</label>
+            <span id="save-status-indicator" class="text-xs font-medium"></span>
+          </div>
           <div class="relative">
-            <select id="resolver-select" onchange="updateConnectionLink()" class="w-full px-4 py-3 rounded-xl border border-slate-700 bg-slate-950 text-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-orange-500 appearance-none cursor-pointer">
-              ${enabledProviders.map(p => `<option value="${p.name}">${p.name}</option>`).join('')}
+            <select id="resolver-select" onchange="updateConnectionLink(); saveSelectedProvider(this.value)" class="w-full px-4 py-3 rounded-xl border border-slate-700 bg-slate-950 text-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-orange-500 appearance-none cursor-pointer">
+              ${enabledProviders.map(p => {
+                const isSel = p.name.toLowerCase() === activeProvider.toLowerCase();
+                return `<option value="${p.name}" ${isSel ? 'selected' : ''}>${p.name}</option>`;
+              }).join('')}
             </select>
             <div class="absolute inset-y-0 right-4 flex items-center pointer-events-none text-slate-400">
               <i data-lucide="chevron-down" class="w-4 h-4"></i>
@@ -3040,6 +3058,40 @@ function getSubscriberPageHTML(user, host, providers) {
   <script>
     const uuid = "${user.uuid}";
     const host = "${host}";
+
+    async function saveSelectedProvider(providerName) {
+      const statusIndicator = document.getElementById('save-status-indicator');
+      if (statusIndicator) {
+        statusIndicator.className = "text-xs text-amber-400 animate-pulse";
+        statusIndicator.innerText = "Saving choice...";
+      }
+      try {
+        const response = await fetch(window.location.pathname, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ provider: providerName })
+        });
+        const result = await response.json();
+        if (result.success) {
+          if (statusIndicator) {
+            statusIndicator.className = "text-xs text-emerald-400";
+            statusIndicator.innerText = "✓ Saved and applied";
+            setTimeout(() => {
+              statusIndicator.innerText = "";
+            }, 3000);
+          }
+        } else {
+          throw new Error(result.error || "Failed to save");
+        }
+      } catch (err) {
+        if (statusIndicator) {
+          statusIndicator.className = "text-xs text-red-400";
+          statusIndicator.innerText = "⚠️ Failed to save: " + err.message;
+        }
+      }
+    }
 
     function updateConnectionLink() {
       const select = document.getElementById('resolver-select');
