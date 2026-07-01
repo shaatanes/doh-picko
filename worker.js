@@ -506,26 +506,9 @@ export default {
 
       let defaultDnsName = settingsMap.get('default_dns') || 'Cloudflare';
 
-      // Handle user's self-selected provider update from the subscriber dashboard page (POST with JSON)
+      // Handle user's self-selected provider update from the subscriber dashboard page (POST with JSON) - Disabled for security
       if (method === 'POST' && request.headers.get('Content-Type')?.includes('application/json')) {
-        try {
-          const { provider } = await request.json();
-          // Check if provider is empty (reset to system default) or a valid enabled provider
-          if (provider) {
-            const exists = providers.find(p => p.name.toLowerCase() === provider.toLowerCase() && p.enabled);
-            if (!exists) {
-              return jsonResponse({ error: "Selected DNS provider is invalid or currently disabled." }, 400);
-            }
-          }
-          
-          await env.DB.prepare("UPDATE users SET dns_provider = ? WHERE uuid = ?").bind(provider || null, uuid).run();
-          userCache.delete(uuid); // Clear cache so the next queries pick up the change immediately
-          dnsCache.clear(); // Clear DNS cache so the change is applied instantly
-          
-          return jsonResponse({ success: true, message: "Upstream DNS resolver updated successfully." });
-        } catch (e) {
-          return jsonResponse({ error: `Failed to update provider choice: ${e.message}` }, 500);
-        }
+        return jsonResponse({ error: "Upstream DNS resolver changes are managed exclusively by the system administrator." }, 403);
       }
 
       // If this is a browser visit (GET request and no 'dns' query param), serve the beautiful dashboard page!
@@ -580,13 +563,9 @@ export default {
       const isCacheEnabled = settingsMap.get('dns_cache_enabled') === 'true';
 
       // Determine DNS Provider URL
-      const customProvider = url.searchParams.get('provider');
       let targetProvider = null;
       if (providers && providers.length > 0) {
-        if (customProvider) {
-          targetProvider = providers.find(p => p.enabled && p.name.toLowerCase() === customProvider.toLowerCase());
-        }
-        if (!targetProvider && user.dns_provider) {
+        if (user.dns_provider) {
           targetProvider = providers.find(p => p.enabled && p.name.toLowerCase() === user.dns_provider.toLowerCase());
         }
         if (!targetProvider) {
@@ -2974,17 +2953,17 @@ function getSubscriberPageHTML(user, host, providers, defaultDnsName) {
         <div class="space-y-2">
           <div class="flex justify-between items-center">
             <label class="text-xs font-semibold text-slate-300 block">Upstream DNS Resolver</label>
-            <span id="save-status-indicator" class="text-xs font-medium"></span>
+            <span class="text-[10px] text-slate-500 font-medium">Managed by Administrator</span>
           </div>
           <div class="relative">
-            <select id="resolver-select" onchange="updateConnectionLink(); saveSelectedProvider(this.value)" class="w-full px-4 py-3 rounded-xl border border-slate-700 bg-slate-950 text-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-orange-500 appearance-none cursor-pointer">
+            <select id="resolver-select" disabled class="w-full px-4 py-3 rounded-xl border border-slate-800 bg-slate-950/50 text-slate-400 text-sm focus:outline-none appearance-none cursor-not-allowed opacity-70">
               ${enabledProviders.map(p => {
                 const isSel = p.name.toLowerCase() === activeProvider.toLowerCase();
                 return `<option value="${p.name}" ${isSel ? 'selected' : ''}>${p.name}</option>`;
               }).join('')}
             </select>
-            <div class="absolute inset-y-0 right-4 flex items-center pointer-events-none text-slate-400">
-              <i data-lucide="chevron-down" class="w-4 h-4"></i>
+            <div class="absolute inset-y-0 right-4 flex items-center pointer-events-none text-slate-500">
+              <i data-lucide="lock" class="w-4 h-4"></i>
             </div>
           </div>
         </div>
@@ -3059,53 +3038,9 @@ function getSubscriberPageHTML(user, host, providers, defaultDnsName) {
     const uuid = "${user.uuid}";
     const host = "${host}";
 
-    async function saveSelectedProvider(providerName) {
-      const statusIndicator = document.getElementById('save-status-indicator');
-      if (statusIndicator) {
-        statusIndicator.className = "text-xs text-amber-400 animate-pulse";
-        statusIndicator.innerText = "Saving choice...";
-      }
-      try {
-        const response = await fetch(window.location.pathname, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({ provider: providerName })
-        });
-        const result = await response.json();
-        if (result.success) {
-          if (statusIndicator) {
-            statusIndicator.className = "text-xs text-emerald-400";
-            statusIndicator.innerText = "✓ Saved and applied";
-            setTimeout(() => {
-              statusIndicator.innerText = "";
-            }, 3000);
-          }
-        } else {
-          throw new Error(result.error || "Failed to save");
-        }
-      } catch (err) {
-        if (statusIndicator) {
-          statusIndicator.className = "text-xs text-red-400";
-          statusIndicator.innerText = "⚠️ Failed to save: " + err.message;
-        }
-      }
-    }
-
     function updateConnectionLink() {
-      const select = document.getElementById('resolver-select');
-      const val = select.value;
       const input = document.getElementById('connection-url-input');
-      
-      // Determine if selected resolver is the default one to keep URL clean, or append query param
-      const isDefault = select.selectedIndex === 0;
-      
-      if (isDefault) {
-        input.value = 'https://' + host + '/dns-query/' + uuid;
-      } else {
-        input.value = 'https://' + host + '/dns-query/' + uuid + '?provider=' + encodeURIComponent(val);
-      }
+      input.value = 'https://' + host + '/dns-query/' + uuid;
     }
 
     function copyConnectionUrl(btn) {
