@@ -295,6 +295,187 @@ async function authenticateAdmin(request, secret) {
   return await verifyJwt(token, secret);
 }
 
+// Helper to detect private or loopback IP addresses
+function isPrivateIp(ipStr) {
+  if (!ipStr) return true;
+  if (ipStr === '127.0.0.1' || ipStr === '::1' || ipStr === 'localhost') return true;
+  if (ipStr.startsWith('10.')) return true;
+  if (ipStr.startsWith('192.168.')) return true;
+  if (ipStr.startsWith('169.254.')) return true;
+  if (ipStr.startsWith('172.')) {
+    const parts = ipStr.split('.');
+    if (parts.length >= 2) {
+      const second = parseInt(parts[1], 10);
+      if (second >= 16 && second <= 31) return true;
+    }
+  }
+  if (ipStr.startsWith('fe80:') || ipStr.startsWith('fc00:') || ipStr.startsWith('fd00:')) return true;
+  return false;
+}
+
+// Helper to parse IPv4 or IPv6 into an ECS-compatible structure
+function parseIp(ipStr) {
+  if (!ipStr) return null;
+  if (ipStr.includes('.')) {
+    // IPv4 parsing
+    const parts = ipStr.split('.').map(x => parseInt(x, 10));
+    if (parts.length === 4 && parts.every(x => !isNaN(x) && x >= 0 && x <= 255)) {
+      return {
+        family: 1, // IPv4
+        prefixLen: 24, // Mask /24 is standard for ECS privacy
+        bytes: parts.slice(0, 3) // 3 bytes representing the subnet
+      };
+    }
+  } else if (ipStr.includes(':')) {
+    // IPv6 parsing
+    let fullIp = ipStr;
+    if (ipStr.includes('::')) {
+      const parts = ipStr.split('::');
+      const left = parts[0] ? parts[0].split(':') : [];
+      const right = parts[1] ? parts[1].split(':') : [];
+      const missingCount = 8 - (left.length + right.length);
+      const middle = Array(missingCount).fill('0');
+      fullIp = [...left, ...middle, ...right].join(':');
+    }
+    const hexParts = fullIp.split(':').map(x => parseInt(x || '0', 16));
+    if (hexParts.length === 8 && hexParts.every(x => !isNaN(x) && x >= 0 && x <= 0xffff)) {
+      const bytes = [];
+      // Grab first 4 blocks (8 bytes) of IPv6 for subnet
+      for (let i = 0; i < 4; i++) {
+        bytes.push((hexParts[i] >> 8) & 0xff);
+        bytes.push(hexParts[i] & 0xff);
+      }
+      return {
+        family: 2, // IPv6
+        prefixLen: 56, // /56 prefix length
+        bytes: bytes.slice(0, 7) // 7 bytes represent /56
+      };
+    }
+  }
+  return null;
+}
+
+// Walks through a DNS message to locate the beginning of the Additional section
+function findAdditionalSectionOffset(view, byteLength) {
+  if (byteLength < 12) return -1;
+  const qdCount = view.getUint16(4);
+  const anCount = view.getUint16(6);
+  const nsCount = view.getUint16(8);
+  
+  let offset = 12;
+
+  // Walk Questions
+  for (let i = 0; i < qdCount; i++) {
+    offset = skipName(view, offset, byteLength);
+    if (offset === -1 || offset + 4 > byteLength) return -1;
+    offset += 4; // Skip QTYPE and QCLASS
+  }
+
+  // Walk Answers
+  for (let i = 0; i < anCount; i++) {
+    offset = skipResourceRecord(view, offset, byteLength);
+    if (offset === -1) return -1;
+  }
+
+  // Walk Authorities
+  for (let i = 0; i < nsCount; i++) {
+    offset = skipResourceRecord(view, offset, byteLength);
+    if (offset === -1) return -1;
+  }
+
+  return offset;
+}
+
+// Utility to skip a DNS name domain (labels)
+function skipName(view, offset, byteLength) {
+  let curr = offset;
+  while (curr < byteLength) {
+    const len = view.getUint8(curr);
+    if (len === 0) {
+      return curr + 1;
+    }
+    if ((len & 0xC0) === 0xC0) {
+      if (curr + 2 > byteLength) return -1;
+      return curr + 2;
+    }
+    curr += 1 + len;
+  }
+  return -1;
+}
+
+// Utility to skip a full DNS Resource Record (RR)
+function skipResourceRecord(view, offset, byteLength) {
+  let curr = skipName(view, offset, byteLength);
+  if (curr === -1 || curr + 10 > byteLength) return -1;
+  const rdLength = view.getUint16(curr + 8);
+  curr += 10 + rdLength;
+  if (curr > byteLength) return -1;
+  return curr;
+}
+
+// Main function to add/override EDNS Client Subnet (ECS) in the DNS message buffer
+function addEcsToDnsQuery(arrayBuffer, clientIp) {
+  if (!arrayBuffer || arrayBuffer.byteLength < 12) return arrayBuffer;
+  if (!clientIp || isPrivateIp(clientIp)) return arrayBuffer;
+
+  const ipInfo = parseIp(clientIp);
+  if (!ipInfo) return arrayBuffer;
+
+  const view = new DataView(arrayBuffer);
+  const additionalOffset = findAdditionalSectionOffset(view, arrayBuffer.byteLength);
+  if (additionalOffset === -1) return arrayBuffer;
+
+  const ecsOptionDataLength = 4 + ipInfo.bytes.length;
+  const ecsOptionTotalLength = 4 + ecsOptionDataLength;
+  const optRecordTotalLength = 11 + ecsOptionTotalLength;
+
+  // Create new DNS packet containing the modified Additional section
+  const newBuffer = new Uint8Array(additionalOffset + optRecordTotalLength);
+  
+  // Copy everything before the Additional section
+  newBuffer.set(new Uint8Array(arrayBuffer, 0, additionalOffset));
+
+  // Set ARCOUNT to 1 in the header (bytes 10 and 11) to indicate we have exactly 1 OPT record
+  newBuffer[10] = 0x00;
+  newBuffer[11] = 0x01;
+
+  // Build OPT record with ECS option at the end of the packet
+  let o = additionalOffset;
+  newBuffer[o++] = 0x00; // NAME: root
+  newBuffer[o++] = 0x00; newBuffer[o++] = 0x29; // TYPE: OPT (41)
+  newBuffer[o++] = 0x04; newBuffer[o++] = 0xd0; // CLASS: UDP payload size (1232)
+  newBuffer[o++] = 0x00; newBuffer[o++] = 0x00; newBuffer[o++] = 0x00; newBuffer[o++] = 0x00; // TTL: 0
+
+  newBuffer[o++] = (ecsOptionTotalLength >> 8) & 0xff;
+  newBuffer[o++] = ecsOptionTotalLength & 0xff; // RDLENGTH
+
+  // EDNS Client Subnet Option
+  newBuffer[o++] = 0x00; newBuffer[o++] = 0x08; // Option Code: 8 (ECS)
+  newBuffer[o++] = (ecsOptionDataLength >> 8) & 0xff;
+  newBuffer[o++] = ecsOptionDataLength & 0xff; // Option Length
+
+  newBuffer[o++] = 0x00; newBuffer[o++] = ipInfo.family; // Family (1 for IPv4, 2 for IPv6)
+  newBuffer[o++] = ipInfo.prefixLen; // Source Prefix-Length
+  newBuffer[o++] = 0x00; // Scope Prefix-Length
+
+  for (let i = 0; i < ipInfo.bytes.length; i++) {
+    newBuffer[o++] = ipInfo.bytes[i];
+  }
+
+  return newBuffer.buffer;
+}
+
+// Converts ArrayBuffer back to standard base64url for DoH GET queries
+function arrayBufferToBase64Url(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.byteLength; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  const b64 = btoa(binary);
+  return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
 // Track database initialization across requests to avoid redundant table checks
 let dbInitialized = false;
 
@@ -646,7 +827,9 @@ export default {
           }
           queryKey = btoa(binary) + '_' + bytes.byteLength;
         }
-        dnsCacheKey = `${providerKey}:${queryKey}`;
+        const ipInfo = parseIp(clientIp);
+        const ecsKey = ipInfo ? `${ipInfo.family}_${ipInfo.bytes.join('.')}` : 'no_ecs';
+        dnsCacheKey = `${providerKey}:${queryKey}:${ecsKey}`;
       }
 
       // Check in-memory DNS cache
@@ -681,6 +864,14 @@ export default {
             }
           } else if (method === 'POST' && requestBody) {
             dnsBuffer = requestBody;
+          }
+
+          // Inject EDNS Client Subnet (ECS) option to preserve geo-routing, low latency, and bypass game regional restrictions
+          if (dnsBuffer) {
+            dnsBuffer = addEcsToDnsQuery(dnsBuffer, clientIp);
+            if (method === 'GET') {
+              targetUrl.searchParams.set('dns', arrayBufferToBase64Url(dnsBuffer));
+            }
           }
 
           function extractQName(buffer) {
@@ -724,8 +915,8 @@ export default {
               method,
               headers: forwardHeaders,
             };
-            if (method !== 'GET' && method !== 'HEAD' && requestBody) {
-              fetchOptions.body = requestBody.slice(0);
+            if (method !== 'GET' && method !== 'HEAD' && dnsBuffer) {
+              fetchOptions.body = dnsBuffer;
             }
             res = await fetch(targetUrl.toString(), fetchOptions);
             
@@ -734,15 +925,15 @@ export default {
             }
           } catch (err) {
             console.error(`Primary DNS provider ${winningProviderName} failed, attempting fallback:`, err);
-            // Fall back to Cloudflare
-            winningProviderName = 'Cloudflare (Fallback)';
-            const fallbackUrl = 'https://1.1.1.1/dns-query';
+            // Fall back to Google (which natively supports ECS/subnet routing and is ultra-stable)
+            winningProviderName = 'Google (Fallback)';
+            const fallbackUrl = 'https://8.8.8.8/dns-query';
             const fetchOptions = {
               method,
               headers: forwardHeaders,
             };
-            if (method !== 'GET' && method !== 'HEAD' && requestBody) {
-              fetchOptions.body = requestBody.slice(0);
+            if (method !== 'GET' && method !== 'HEAD' && dnsBuffer) {
+              fetchOptions.body = dnsBuffer;
             }
             res = await fetch(fallbackUrl, fetchOptions);
           }
