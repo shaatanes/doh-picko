@@ -1037,7 +1037,7 @@ export default {
           const cfMode = cfModeRow?.value || 'Automatic';
 
           const cacheEnabledRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'dns_cache_enabled'").first();
-          const dnsCache = cacheEnabledRow?.value || 'false';
+          const dnsCacheVal = cacheEnabledRow?.value || 'false';
 
           const customUaRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'custom_user_agent'").first();
           const customUa = customUaRow?.value || '';
@@ -1061,7 +1061,7 @@ export default {
             config: {
               defaultDns,
               cfMode,
-              dnsCache,
+              dnsCache: dnsCacheVal,
               customUa,
               queriesPerGb
             },
@@ -1079,7 +1079,7 @@ export default {
       // POST /api/settings - Update application settings
       if (method === 'POST' && url.pathname === '/api/settings') {
         try {
-          const { defaultDns, cfMode, dnsCache, customUa, queriesPerGb, adminPassword, providers } = await request.json();
+          const { defaultDns, cfMode, dnsCache: dnsCacheParam, customUa, queriesPerGb, adminPassword, providers } = await request.json();
 
           // Fetch current providers list to validate defaultDns
           let currentProviders = providers;
@@ -1098,8 +1098,8 @@ export default {
           if (cfMode !== undefined) {
             await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('cloudflare_mode', ?)").bind(cfMode).run();
           }
-          if (dnsCache !== undefined) {
-            await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('dns_cache_enabled', ?)").bind(dnsCache ? 'true' : 'false').run();
+          if (dnsCacheParam !== undefined) {
+            await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('dns_cache_enabled', ?)").bind(dnsCacheParam ? 'true' : 'false').run();
           }
           if (customUa !== undefined) {
             await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('custom_user_agent', ?)").bind(customUa).run();
