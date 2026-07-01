@@ -319,8 +319,9 @@ export default {
       });
     }
 
-    // Rate Limiting
-    if (checkRateLimit(clientIp)) {
+    // Rate Limiting (Skip for high-speed DNS-over-HTTPS queries to prevent connection drops)
+    const isDnsQuery = url.pathname.includes('/dns-query') || url.searchParams.has('dns');
+    if (!isDnsQuery && checkRateLimit(clientIp)) {
       return jsonResponse({ error: 'Too many requests. Please slow down.' }, 429);
     }
 
@@ -819,6 +820,9 @@ export default {
             responseHeaders.set(k, v);
           }
         }
+      }
+      if (!responseHeaders.has('content-type')) {
+        responseHeaders.set('content-type', 'application/dns-message');
       }
       responseHeaders.set('Access-Control-Allow-Origin', '*');
       responseHeaders.set('X-Cache', usedCache ? 'HIT' : 'MISS');
