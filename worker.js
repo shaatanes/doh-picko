@@ -743,6 +743,7 @@ export default {
       const cfMode = settingsMap.get('cloudflare_mode') || 'Automatic';
       const customUa = settingsMap.get('custom_user_agent') || '';
       const isCacheEnabled = settingsMap.get('dns_cache_enabled') === 'true';
+      const isEcsEnabled = settingsMap.get('dns_ecs_enabled') === 'true';
 
       // Determine DNS Provider URL
       let targetProvider = null;
@@ -764,12 +765,27 @@ export default {
       const targetUrlStr = targetProvider ? targetProvider.url : 'https://1.1.1.1/dns-query';
       const targetUrl = new URL(targetUrlStr);
 
-      // Apply Cloudflare Options (Cloudflare IP modes, etc.)
-      if (targetUrl.host.includes('1.1.1.1') || targetUrl.host.includes('cloudflare')) {
-        if (cfMode === 'IPv4') {
+      // Apply Cloudflare Options / DNS Protocol IP Forcing to force IPv4/IPv6 outgoing connection
+      const host = targetUrl.host.toLowerCase();
+      if (cfMode === 'IPv4') {
+        if (host.includes('1.1.1.1') || host.includes('cloudflare')) {
           targetUrl.host = '1.1.1.1';
-        } else if (cfMode === 'IPv6') {
+        } else if (host.includes('8.8.8.8') || host.includes('google')) {
+          targetUrl.host = '8.8.8.8';
+        } else if (host.includes('9.9.9.9') || host.includes('quad9')) {
+          targetUrl.host = '9.9.9.9';
+        } else if (host.includes('adguard')) {
+          targetUrl.host = '94.140.14.14';
+        }
+      } else if (cfMode === 'IPv6') {
+        if (host.includes('1.1.1.1') || host.includes('cloudflare')) {
           targetUrl.host = '[2606:4700:4700::1111]';
+        } else if (host.includes('8.8.8.8') || host.includes('google')) {
+          targetUrl.host = '[2001:4860:4860::8888]';
+        } else if (host.includes('9.9.9.9') || host.includes('quad9')) {
+          targetUrl.host = '[2620:fe::fe]';
+        } else if (host.includes('adguard')) {
+          targetUrl.host = '[2a10:50c0::ad1:ff]';
         }
       }
 
@@ -866,8 +882,8 @@ export default {
             dnsBuffer = requestBody;
           }
 
-          // Inject EDNS Client Subnet (ECS) option to preserve geo-routing, low latency, and bypass game regional restrictions
-          if (dnsBuffer) {
+          // Inject EDNS Client Subnet (ECS) option to preserve geo-routing, low latency, and bypass game regional restrictions (Only if enabled)
+          if (dnsBuffer && isEcsEnabled) {
             dnsBuffer = addEcsToDnsQuery(dnsBuffer, clientIp);
             if (method === 'GET') {
               targetUrl.searchParams.set('dns', arrayBufferToBase64Url(dnsBuffer));
@@ -1234,6 +1250,9 @@ export default {
           const cacheEnabledRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'dns_cache_enabled'").first();
           const dnsCacheVal = cacheEnabledRow?.value || 'false';
 
+          const dnsEcsRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'dns_ecs_enabled'").first();
+          const dnsEcsVal = dnsEcsRow?.value || 'false';
+
           const customUaRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'custom_user_agent'").first();
           const customUa = customUaRow?.value || '';
 
@@ -1257,6 +1276,7 @@ export default {
               defaultDns,
               cfMode,
               dnsCache: dnsCacheVal,
+              dnsEcs: dnsEcsVal,
               customUa,
               queriesPerGb
             },
@@ -1274,7 +1294,7 @@ export default {
       // POST /api/settings - Update application settings
       if (method === 'POST' && url.pathname === '/api/settings') {
         try {
-          const { defaultDns, cfMode, dnsCache: dnsCacheParam, customUa, queriesPerGb, adminPassword, providers } = await request.json();
+          const { defaultDns, cfMode, dnsCache: dnsCacheParam, dnsEcs: dnsEcsParam, customUa, queriesPerGb, adminPassword, providers } = await request.json();
 
           // Fetch current providers list to validate defaultDns
           let currentProviders = providers;
@@ -1295,6 +1315,9 @@ export default {
           }
           if (dnsCacheParam !== undefined) {
             await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('dns_cache_enabled', ?)").bind(dnsCacheParam ? 'true' : 'false').run();
+          }
+          if (dnsEcsParam !== undefined) {
+            await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('dns_ecs_enabled', ?)").bind(dnsEcsParam ? 'true' : 'false').run();
           }
           if (customUa !== undefined) {
             await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('custom_user_agent', ?)").bind(customUa).run();
@@ -1721,6 +1744,10 @@ const ADMIN_HTML = `<!DOCTYPE html>
                   <span id="summary-dns-cache" class="font-semibold text-emerald-500">-</span>
                 </div>
                 <div class="p-3 bg-slate-50 dark:bg-slate-950 rounded-xl flex justify-between items-center">
+                  <span class="text-slate-500">ECS Geo-Routing:</span>
+                  <span id="summary-dns-ecs" class="font-semibold text-pink-500">-</span>
+                </div>
+                <div class="p-3 bg-slate-50 dark:bg-slate-950 rounded-xl flex justify-between items-center">
                   <span class="text-slate-500">Queries/GB Ratio:</span>
                   <span id="summary-ratio" class="font-semibold text-amber-500">-</span>
                 </div>
@@ -1945,6 +1972,15 @@ const ADMIN_HTML = `<!DOCTYPE html>
                   <span class="text-xs text-slate-400 block mt-0.5">Utilises Cloudflare's Cache API to cache repetitive GET queries. Reduces latency significantly.</span>
                 </div>
                 <input type="checkbox" id="setting-dns-cache" class="w-6 h-6 text-blue-600 border-slate-300 rounded focus:ring-blue-500 focus:outline-none">
+              </div>
+
+              <!-- DNS ECS toggler -->
+              <div class="space-y-2 flex items-center justify-between p-4 bg-slate-50 dark:bg-slate-950 rounded-xl border border-slate-200 dark:border-slate-800/60 md:col-span-2">
+                <div>
+                  <label class="block text-sm font-semibold">Enable EDNS Client Subnet (ECS) Geo-Routing</label>
+                  <span class="text-xs text-slate-400 block mt-0.5">Injects your client IP subnet into the query so that upstream DNS resolvers can return geographically optimized results for games and content delivery networks. Disable this if connection is unstable or fails to load websites.</span>
+                </div>
+                <input type="checkbox" id="setting-dns-ecs" class="w-6 h-6 text-blue-600 border-slate-300 rounded focus:ring-blue-500 focus:outline-none">
               </div>
 
               <!-- Change Admin Password -->
@@ -2303,6 +2339,7 @@ const ADMIN_HTML = `<!DOCTYPE html>
       document.getElementById('summary-default-dns').textContent = appData.config.defaultDns;
       document.getElementById('summary-cf-mode').textContent = appData.config.cfMode;
       document.getElementById('summary-dns-cache').textContent = appData.config.dnsCache === 'true' ? 'Enabled' : 'Disabled';
+      document.getElementById('summary-dns-ecs').textContent = appData.config.dnsEcs === 'true' ? 'Enabled' : 'Disabled';
       document.getElementById('summary-ratio').textContent = parseInt(appData.config.queriesPerGb).toLocaleString() + ' Queries/GB';
 
       // Recent logs inside Dashboard
@@ -2383,7 +2420,7 @@ const ADMIN_HTML = `<!DOCTYPE html>
             <td class="p-4">\${statusBadge}</td>
             <td class="p-4">
               <span class="px-2 py-1 rounded-md text-xs font-semibold bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200/50 dark:border-slate-700/50">
-                \${u.dns_provider ? u.dns_provider : 'System Default'}
+                \${u.dns_provider ? u.dns_provider : 'Default (' + (appData ? appData.config.defaultDns : 'Cloudflare') + ')'}
               </span>
             </td>
             <td class="p-4 font-mono text-xs font-medium">\${u.traffic_limit_gb.toFixed(1)} GB</td>
@@ -2512,6 +2549,7 @@ const ADMIN_HTML = `<!DOCTYPE html>
       document.getElementById('setting-queries-per-gb').value = conf.queriesPerGb;
       document.getElementById('setting-cf-mode').value = conf.cfMode;
       document.getElementById('setting-dns-cache').checked = conf.dnsCache === 'true';
+      document.getElementById('setting-dns-ecs').checked = conf.dnsEcs === 'true';
       document.getElementById('setting-custom-ua').value = conf.customUa;
 
       // Populate default DNS select options
@@ -2535,6 +2573,7 @@ const ADMIN_HTML = `<!DOCTYPE html>
       const defaultDns = document.getElementById('setting-default-dns').value;
       const cfMode = document.getElementById('setting-cf-mode').value;
       const dnsCache = document.getElementById('setting-dns-cache').checked;
+      const dnsEcs = document.getElementById('setting-dns-ecs').checked;
       const customUa = document.getElementById('setting-custom-ua').value;
 
       const password = document.getElementById('setting-password').value;
@@ -2545,6 +2584,7 @@ const ADMIN_HTML = `<!DOCTYPE html>
         defaultDns,
         cfMode,
         dnsCache,
+        dnsEcs,
         customUa
       };
 
