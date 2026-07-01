@@ -777,14 +777,18 @@ export default {
         const isoNow = new Date().toISOString();
 
         // Update in-memory user cache with the updated data so we don't serve stale stats from cache
-        const updatedUserData = {
-          ...user,
-          query_count: updatedQueryCount,
-          used_gb: updatedUsedGb,
-          remaining_gb: updatedRemainingGb,
-          last_activity: isoNow
-        };
-        userCache.set(uuid, { data: updatedUserData, timestamp: Date.now() });
+        // ONLY if the cache hasn't been deleted or updated by an admin in the meantime!
+        const currentCached = userCache.get(uuid);
+        if (currentCached && currentCached.data.dns_provider === user.dns_provider && currentCached.data.enabled === user.enabled) {
+          const updatedUserData = {
+            ...user,
+            query_count: updatedQueryCount,
+            used_gb: updatedUsedGb,
+            remaining_gb: updatedRemainingGb,
+            last_activity: isoNow
+          };
+          userCache.set(uuid, { data: updatedUserData, timestamp: Date.now() });
+        }
 
         // Transactional-style DB updates (Fully asynchronous, non-blocking)
         ctx.waitUntil((async () => {
