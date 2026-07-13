@@ -984,10 +984,10 @@ export default {
             }
 
             try {
-              // Perform DoH query to selected provider with a robust 4500ms timeout
-              res = await fetchWithTimeout(primaryUrl, fetchOptions, 4500);
+              // Perform DoH query to selected provider with a robust 5000ms timeout
+              res = await fetchWithTimeout(primaryUrl, fetchOptions, 5000);
             } catch (firstErr) {
-              console.warn(`Primary DNS query to ${primaryName} failed, retrying same provider (without ECS for compatibility)... Error:`, firstErr);
+              console.warn(`Primary DNS query to ${primaryName} failed, retrying same provider (without ECS/original buffer for compatibility)... Error:`, firstErr);
               // Retry exactly once on the SAME user-selected provider to ensure maximum reliability with no cross-fallback leaks
               // But on retry, we use the original unmodified DNS buffer (no ECS) in case ECS/packet manipulation was the cause of the failure!
               let retryUrl = primaryUrl;
@@ -1004,11 +1004,114 @@ export default {
                 }
               }
 
-              res = await fetchWithTimeout(retryUrl, retryOptions, 4500);
+              res = await fetchWithTimeout(retryUrl, retryOptions, 5000);
             }
           } catch (err) {
-            console.error(`DNS query to selected provider ${primaryName} failed completely:`, err);
-            throw err;
+            console.warn(`DNS query to selected provider ${primaryName} failed completely: ${err.message}. Initiating smart fallback...`);
+            
+            // SMART FALLBACK MECHANISM
+            let fallbackRes = null;
+            let fallbackUsedName = '';
+            
+            // 1. If it was a gaming/anti-sanction DNS, try other active gaming DNS providers first to preserve sanction-bypass capability
+            if (isGamingDns(primaryName)) {
+              const otherGamingProviders = providers.filter(p => 
+                p.enabled && 
+                p.name.toLowerCase() !== primaryName.toLowerCase() && 
+                isGamingDns(p.name)
+              );
+              
+              for (const gProv of otherGamingProviders) {
+                try {
+                  console.log(`Trying alternative gaming fallback provider: ${gProv.name}`);
+                  const gUrl = new URL(gProv.url);
+                  for (const [key, value] of url.searchParams.entries()) {
+                    if (key !== 'provider') {
+                      gUrl.searchParams.set(key, value);
+                    }
+                  }
+                  
+                  const gFetchOptions = {
+                    method,
+                    headers: forwardHeaders
+                  };
+                  if (method === 'GET' && originalDnsBuffer) {
+                    gUrl.searchParams.set('dns', arrayBufferToBase64Url(originalDnsBuffer));
+                  } else if (method !== 'GET' && method !== 'HEAD' && originalDnsBuffer) {
+                    gFetchOptions.body = originalDnsBuffer;
+                  }
+                  
+                  fallbackRes = await fetchWithTimeout(gUrl.toString(), gFetchOptions, 4000);
+                  fallbackUsedName = gProv.name;
+                  console.log(`Alternative gaming fallback to ${gProv.name} succeeded!`);
+                  break;
+                } catch (gErr) {
+                  console.warn(`Alternative gaming fallback to ${gProv.name} failed: ${gErr.message}`);
+                }
+              }
+            }
+            
+            // 2. If fallbackRes is still null, try standard reliable DNS (Default DNS, Google, or Cloudflare) in sequence
+            if (!fallbackRes) {
+              const standardFallbacks = [];
+              
+              if (defaultDnsName.toLowerCase() !== primaryName.toLowerCase()) {
+                const defProv = providers.find(p => p.name.toLowerCase() === defaultDnsName.toLowerCase() && p.enabled);
+                if (defProv) standardFallbacks.push(defProv);
+              }
+              
+              const googleProv = providers.find(p => p.name.toLowerCase() === 'google' && p.enabled) || { name: 'Google', url: 'https://8.8.8.8/dns-query' };
+              if (googleProv.name.toLowerCase() !== primaryName.toLowerCase() && !standardFallbacks.some(p => p.name.toLowerCase() === googleProv.name.toLowerCase())) {
+                standardFallbacks.push(googleProv);
+              }
+              
+              const cfProv = providers.find(p => p.name.toLowerCase() === 'cloudflare' && p.enabled) || { name: 'Cloudflare', url: 'https://1.1.1.1/dns-query' };
+              if (cfProv.name.toLowerCase() !== primaryName.toLowerCase() && !standardFallbacks.some(p => p.name.toLowerCase() === cfProv.name.toLowerCase())) {
+                standardFallbacks.push(cfProv);
+              }
+              
+              for (const sProv of standardFallbacks) {
+                try {
+                  console.log(`Trying standard fallback provider: ${sProv.name}`);
+                  const sUrl = new URL(sProv.url);
+                  for (const [key, value] of url.searchParams.entries()) {
+                    if (key !== 'provider') {
+                      sUrl.searchParams.set(key, value);
+                    }
+                  }
+                  
+                  const sShouldInjectEcs = isEcsEnabled && !isGamingDns(sProv.name);
+                  let sDnsBuffer = originalDnsBuffer;
+                  if (sDnsBuffer && sShouldInjectEcs) {
+                    sDnsBuffer = addEcsToDnsQuery(sDnsBuffer, clientIp);
+                  }
+                  
+                  const sFetchOptions = {
+                    method,
+                    headers: forwardHeaders
+                  };
+                  if (method === 'GET' && sDnsBuffer) {
+                    sUrl.searchParams.set('dns', arrayBufferToBase64Url(sDnsBuffer));
+                  } else if (method !== 'GET' && method !== 'HEAD' && sDnsBuffer) {
+                    sFetchOptions.body = sDnsBuffer;
+                  }
+                  
+                  fallbackRes = await fetchWithTimeout(sUrl.toString(), sFetchOptions, 4000);
+                  fallbackUsedName = sProv.name;
+                  console.log(`Standard fallback to ${sProv.name} succeeded!`);
+                  break;
+                } catch (sErr) {
+                  console.warn(`Standard fallback to ${sProv.name} failed: ${sErr.message}`);
+                }
+              }
+            }
+            
+            if (fallbackRes) {
+              res = fallbackRes;
+              winningProviderName = fallbackUsedName;
+            } else {
+              throw err;
+            }
           }
 
           dohResponseStatus = res.status;
