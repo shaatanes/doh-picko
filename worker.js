@@ -978,7 +978,7 @@ export default {
           };
 
           // Smart UDP DNS Helper for Node.js environments
-          async function tryDnsUdp(providerName, dnsBuffer, targetUrl, timeoutMs = 2000) {
+          async function tryDnsUdp(providerName, dnsBuffer, targetUrl, timeoutMs = 1200) {
             if (typeof process === 'undefined' || !process.versions || !process.versions.node) {
               return null; // Only run inside Node.js simulation container where dgram is fully available
             }
@@ -1009,13 +1009,13 @@ export default {
             } else if (lowerName.includes('opendns')) {
               ips = ['208.67.222.222', '208.67.220.220'];
             } else if (lowerName.includes('shecan') || lowerName.includes('شکن')) {
-              ips = ['178.22.122.100', '178.22.122.101', '185.51.200.2'];
+              ips = ['178.22.122.100', '185.51.200.2', '178.22.122.101'];
             } else if (lowerName.includes('403')) {
-              ips = ['10.202.10.10', '10.202.10.11', '108.61.170.199'];
+              ips = ['108.61.170.199', '10.202.10.10', '10.202.10.11'];
             } else if (lowerName.includes('electro') || lowerName.includes('الکترو')) {
-              ips = ['78.157.108.10', '78.157.108.11', '178.22.122.100', '10.202.10.10'];
+              ips = ['78.157.108.10', '78.157.108.11', '108.61.170.199', '178.22.122.100'];
             } else if (lowerName.includes('radar') || lowerName.includes('رادار')) {
-              ips = ['10.202.10.10', '10.202.10.11', '178.22.122.100'];
+              ips = ['108.61.170.199', '10.202.10.10', '10.202.10.11', '178.22.122.100'];
             } else if (lowerName.includes('ali') || lowerName.includes('alibaba')) {
               ips = ['223.5.5.5', '223.6.6.6'];
             } else if (lowerName.includes('114')) {
@@ -1170,35 +1170,55 @@ export default {
           } catch (err) {
             console.error(`DNS query to selected provider ${primaryName} failed completely:`, err);
             
-            // Self-healing failover: If selected provider is broken/blocked, automatically fallback to ultra-reliable Cloudflare DNS (1.1.1.1) to preserve client connectivity!
+            // Self-healing failover: If selected provider is broken/blocked, automatically fallback
             if (primaryName.toLowerCase() !== 'cloudflare') {
-              console.warn(`[FAILOVER] Primary provider ${primaryName} is unreachable. Falling back to Cloudflare DNS to preserve client connectivity...`);
-              try {
-                const fallbackUrl = 'https://1.1.1.1/dns-query';
-                const fallbackUdp = await tryDnsUdp('Cloudflare', dnsBuffer, new URL(fallbackUrl));
-                if (fallbackUdp) {
-                  res = fallbackUdp;
-                } else {
-                  const fallbackOptions = {
-                    method,
-                    headers: new Headers({
-                      'Accept': 'application/dns-message',
-                      'User-Agent': 'DNS-over-HTTPS-Subscription/Failover-1.0'
-                    })
-                  };
-                  if (method === 'POST') {
-                    fallbackOptions.headers.set('Content-Type', 'application/dns-message');
+              let resolvedViaGamingFallback = false;
+              
+              // If the user selected a gaming/anti-sanction DNS, we prefer falling back to another robust gaming DNS (403 Online)
+              // to preserve the sanction bypass functionality, rather than falling back to standard clean DNS!
+              if (isGamingDns(primaryName)) {
+                console.warn(`[FAILOVER] Primary gaming DNS ${primaryName} failed. Attempting fallback to robust 403 Online DNS to preserve sanction bypass...`);
+                try {
+                  const gamingFallbackUdp = await tryDnsUdp('403 Online', dnsBuffer, new URL('https://dns.403.ir/dns-query'));
+                  if (gamingFallbackUdp) {
+                    res = gamingFallbackUdp;
+                    resolvedViaGamingFallback = true;
+                    console.log(`[FAILOVER] Successfully resolved gaming query via fallback 403 Online DNS.`);
                   }
-                  if (method !== 'GET' && method !== 'HEAD' && dnsBuffer) {
-                    fallbackOptions.body = dnsBuffer;
-                  }
-                  const fallbackGetUrl = method === 'GET' && dnsBuffer ? fallbackUrl + '?dns=' + arrayBufferToBase64Url(dnsBuffer) : fallbackUrl;
-                  res = await fetchWithTimeout(fallbackGetUrl, fallbackOptions, 4000);
+                } catch (gErr) {
+                  console.warn(`[FAILOVER] Fallback to 403 Online DNS failed:`, gErr);
                 }
-                console.log(`[FAILOVER] Successfully resolved query via fallback Cloudflare DNS.`);
-              } catch (fallbackErr) {
-                console.error(`[FAILOVER] Fallback Cloudflare DNS also failed:`, fallbackErr);
-                throw err; // Throw original error if fallback also fails
+              }
+              
+              if (!resolvedViaGamingFallback) {
+                console.warn(`[FAILOVER] Falling back to Cloudflare DNS to preserve client connectivity...`);
+                try {
+                  const fallbackUrl = 'https://1.1.1.1/dns-query';
+                  const fallbackUdp = await tryDnsUdp('Cloudflare', dnsBuffer, new URL(fallbackUrl));
+                  if (fallbackUdp) {
+                    res = fallbackUdp;
+                  } else {
+                    const fallbackOptions = {
+                      method,
+                      headers: new Headers({
+                        'Accept': 'application/dns-message',
+                        'User-Agent': 'DNS-over-HTTPS-Subscription/Failover-1.0'
+                      })
+                    };
+                    if (method === 'POST') {
+                      fallbackOptions.headers.set('Content-Type', 'application/dns-message');
+                    }
+                    if (method !== 'GET' && method !== 'HEAD' && dnsBuffer) {
+                      fallbackOptions.body = dnsBuffer;
+                    }
+                    const fallbackGetUrl = method === 'GET' && dnsBuffer ? fallbackUrl + '?dns=' + arrayBufferToBase64Url(dnsBuffer) : fallbackUrl;
+                    res = await fetchWithTimeout(fallbackGetUrl, fallbackOptions, 4000);
+                  }
+                  console.log(`[FAILOVER] Successfully resolved query via fallback Cloudflare DNS.`);
+                } catch (fallbackErr) {
+                  console.error(`[FAILOVER] Fallback Cloudflare DNS also failed:`, fallbackErr);
+                  throw err; // Throw original error if fallback also fails
+                }
               }
             } else {
               throw err;
