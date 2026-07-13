@@ -573,7 +573,7 @@ export default {
 
     // DNS over HTTPS Handler (Checks subscriptions, does accounting, forwards query)
     // Supports path variables /dns-query/:uuid and query params /dns-query?uuid=...
-    const dohMatch = url.pathname.match(/^\/dns-query\/?([a-fA-F0-9\-]+)?$/) || url.pathname.match(/^\/([a-fA-F0-9\-]+)\/dns-query\/?$/);
+    const dohMatch = url.pathname.match(/^\/dns-query\/?([a-zA-Z0-9\-_]+)?$/) || url.pathname.match(/^\/([a-zA-Z0-9\-_]+)\/dns-query\/?$/);
     if (dohMatch) {
       const pathUuid = dohMatch[1];
       const queryUuid = url.searchParams.get('uuid');
@@ -893,7 +893,7 @@ export default {
             const dnsParam = url.searchParams.get('dns');
             if (dnsParam) {
               try {
-                let b64 = dnsParam.replace(/-/g, '+').replace(/_/g, '/');
+                let b64 = dnsParam.replace(/ /g, '+').replace(/-/g, '+').replace(/_/g, '/');
                 while (b64.length % 4) b64 += '=';
                 const binary = atob(b64);
                 const bytes = new Uint8Array(binary.length);
@@ -987,12 +987,20 @@ export default {
               // Perform DoH query to selected provider with a robust 5000ms timeout
               res = await fetchWithTimeout(primaryUrl, fetchOptions, 5000);
             } catch (firstErr) {
-              console.warn(`Primary DNS query to ${primaryName} failed, retrying same provider (without ECS/original buffer for compatibility)... Error:`, firstErr);
-              // Retry exactly once on the SAME user-selected provider to ensure maximum reliability with no cross-fallback leaks
-              // But on retry, we use the original unmodified DNS buffer (no ECS) in case ECS/packet manipulation was the cause of the failure!
-              let retryUrl = primaryUrl;
-              let retryOptions = { ...fetchOptions };
+              console.warn(`Primary DNS query to ${primaryName} failed, retrying same provider with clean, unshared body buffer/headers for compatibility... Error:`, firstErr);
+              
+              // Reconstruct clean headers and retry options from scratch to ensure no shared/consumed stream issues
+              const retryHeaders = new Headers();
+              forwardHeaders.forEach((v, k) => retryHeaders.set(k, v));
 
+              const retryOptions = {
+                method,
+                headers: retryHeaders
+              };
+
+              let retryUrl = primaryUrl;
+
+              // If we are retrying, we prefer the unmodified clean original buffer (no ECS) in case packet modification was rejected
               if (shouldInjectEcs) {
                 const cleanUrl = new URL(targetUrl.toString());
                 if (method === 'GET' && originalDnsBuffer) {
@@ -1000,7 +1008,11 @@ export default {
                 }
                 retryUrl = cleanUrl.toString();
                 if (method !== 'GET' && method !== 'HEAD' && originalDnsBuffer) {
-                  retryOptions.body = originalDnsBuffer;
+                  retryOptions.body = originalDnsBuffer.slice(0); // Slice(0) creates a fresh independent ArrayBuffer
+                }
+              } else {
+                if (method !== 'GET' && method !== 'HEAD' && dnsBuffer) {
+                  retryOptions.body = dnsBuffer.slice(0); // Slice(0) ensures no locking/stream reuse crashes
                 }
               }
 
