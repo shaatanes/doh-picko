@@ -313,6 +313,13 @@ function isPrivateIp(ipStr) {
   return false;
 }
 
+// Helper to detect if a DNS provider is gaming/anti-sanction
+function isGamingDns(name) {
+  if (!name) return false;
+  const n = name.toLowerCase();
+  return n.includes('radar') || n.includes('electro') || n.includes('403') || n.includes('shecan');
+}
+
 // Helper to parse IPv4 or IPv6 into an ECS-compatible structure
 function parseIp(ipStr) {
   if (!ipStr) return null;
@@ -688,9 +695,27 @@ export default {
 
       let defaultDnsName = settingsMap.get('default_dns') || 'Cloudflare';
 
-      // Handle user's self-selected provider update from the subscriber dashboard page (POST with JSON) - Disabled for security
+      // Handle user's self-selected provider update from the subscriber dashboard page (POST with JSON)
       if (method === 'POST' && request.headers.get('Content-Type')?.includes('application/json')) {
-        return jsonResponse({ error: "Upstream DNS resolver changes are managed exclusively by the system administrator." }, 403);
+        try {
+          const { dns_provider } = await request.json();
+          let nextDnsProvider = null;
+          if (dns_provider) {
+            const found = providers.find(p => p.enabled && p.name.toLowerCase() === dns_provider.toLowerCase());
+            if (!found) {
+              return jsonResponse({ error: 'The selected DNS resolver is disabled or invalid.' }, 400);
+            }
+            nextDnsProvider = found.name;
+          }
+
+          await env.DB.prepare("UPDATE users SET dns_provider = ? WHERE uuid = ?").bind(nextDnsProvider, uuid).run();
+          userCache.delete(uuid); // Invalidate cache immediately
+          dnsCache.clear(); // Clear DNS query caches
+
+          return jsonResponse({ success: true, dns_provider: nextDnsProvider });
+        } catch (e) {
+          return jsonResponse({ error: `Update failed: ${e.message}` }, 500);
+        }
       }
 
       // If this is a browser visit (GET request and no 'dns' query param), serve the beautiful dashboard page!
@@ -843,7 +868,7 @@ export default {
           }
           queryKey = btoa(binary) + '_' + bytes.byteLength;
         }
-        const ipInfo = parseIp(clientIp);
+        const ipInfo = isEcsEnabled ? parseIp(clientIp) : null;
         const ecsKey = ipInfo ? `${ipInfo.family}_${ipInfo.bytes.join('.')}` : 'no_ecs';
         dnsCacheKey = `${providerKey}:${queryKey}:${ecsKey}`;
       }
@@ -925,33 +950,139 @@ export default {
 
           const queriedDomain = extractQName(dnsBuffer);
 
+          // Determine URLs and names for the staggered race
+          const primaryUrl = targetUrl.toString();
+          const primaryName = winningProviderName;
+
+          let fallbackUrl = 'https://8.8.8.8/dns-query';
+          let fallbackName = 'Google (Fallback)';
+
+          if (isGamingDns(primaryName)) {
+            // Find another enabled gaming/anti-sanction provider as a high-performance fallback
+            const otherGaming = providers.find(p => p.enabled && p.name.toLowerCase() !== primaryName.toLowerCase() && isGamingDns(p.name));
+            if (otherGaming) {
+              fallbackUrl = otherGaming.url;
+              fallbackName = `${otherGaming.name} (Fallback)`;
+            }
+          } else {
+            // For general providers, use Google/Cloudflare as fallback
+            if (primaryName.toLowerCase().includes('cloudflare')) {
+              fallbackUrl = 'https://8.8.8.8/dns-query';
+              fallbackName = 'Google (Fallback)';
+            } else {
+              fallbackUrl = 'https://1.1.1.1/dns-query';
+              fallbackName = 'Cloudflare (Fallback)';
+            }
+          }
+
+          // Helper to fetch with an exact timeout
+          const fetchWithTimeout = async (urlStr, options, timeoutMs) => {
+            const controller = new AbortController();
+            const id = setTimeout(() => controller.abort(), timeoutMs);
+            try {
+              const r = await fetch(urlStr, { ...options, signal: controller.signal });
+              clearTimeout(id);
+              if (!r.ok) {
+                throw new Error(`Upstream returned status ${r.status}`);
+              }
+              return r;
+            } catch (err) {
+              clearTimeout(id);
+              throw err;
+            }
+          };
+
           let res;
           try {
-            const fetchOptions = {
-              method,
-              headers: forwardHeaders,
-            };
-            if (method !== 'GET' && method !== 'HEAD' && dnsBuffer) {
-              fetchOptions.body = dnsBuffer;
-            }
-            res = await fetch(targetUrl.toString(), fetchOptions);
-            
-            if (!res.ok) {
-              throw new Error(`Upstream returned status ${res.status}`);
-            }
-          } catch (err) {
-            console.error(`Primary DNS provider ${winningProviderName} failed, attempting fallback:`, err);
-            // Fall back to Google (which natively supports ECS/subnet routing and is ultra-stable)
-            winningProviderName = 'Google (Fallback)';
-            const fallbackUrl = 'https://8.8.8.8/dns-query';
-            const fetchOptions = {
-              method,
-              headers: forwardHeaders,
-            };
-            if (method !== 'GET' && method !== 'HEAD' && dnsBuffer) {
-              fetchOptions.body = dnsBuffer;
-            }
-            res = await fetch(fallbackUrl, fetchOptions);
+            let finished = false;
+            let startFallback;
+            const fallbackTrigger = new Promise(resolve => {
+              startFallback = resolve;
+            });
+
+            const staggerTimer = setTimeout(() => {
+              if (startFallback) startFallback();
+            }, 600);
+
+            // Staggered racing execution:
+            // 1. Kick off primary DNS query with 2500ms timeout
+            // 2. Wait for 600ms. If primary has not responded, or if primary fails early, kick off fallback DNS query
+            // 3. Return whichever successful response completes first!
+            const primaryPromise = (async () => {
+              try {
+                const fetchOptions = {
+                  method,
+                  headers: forwardHeaders
+                };
+                if (method !== 'GET' && method !== 'HEAD' && dnsBuffer) {
+                  fetchOptions.body = dnsBuffer;
+                }
+                const r = await fetchWithTimeout(primaryUrl, fetchOptions, 2500);
+                return { response: r, name: primaryName };
+              } catch (err) {
+                // If primary fails early, trigger fallback immediately to save time!
+                if (startFallback) startFallback();
+                throw err;
+              }
+            })();
+
+            const fallbackPromise = (async () => {
+              await fallbackTrigger; // Wait for 600ms stagger or early primary failure
+              clearTimeout(staggerTimer);
+
+              if (finished) {
+                throw new Error("Already resolved");
+              }
+              const fetchOptions = {
+                method,
+                headers: forwardHeaders
+              };
+              if (method !== 'GET' && method !== 'HEAD' && dnsBuffer) {
+                fetchOptions.body = dnsBuffer;
+              }
+              // Adjust fallback URL search parameters for GET request if dnsBuffer is mutated
+              const finalFallbackUrl = new URL(fallbackUrl);
+              for (const [key, value] of url.searchParams.entries()) {
+                if (key !== 'provider') {
+                  finalFallbackUrl.searchParams.set(key, value);
+                }
+              }
+              if (dnsBuffer && isEcsEnabled) {
+                finalFallbackUrl.searchParams.set('dns', arrayBufferToBase64Url(dnsBuffer));
+              }
+              const r = await fetchWithTimeout(finalFallbackUrl.toString(), fetchOptions, 2000);
+              return { response: r, name: fallbackName };
+            })();
+
+            const raceResult = await new Promise((resolve, reject) => {
+              let errorCount = 0;
+              const errors = [];
+
+              const handleSuccess = (val) => {
+                if (!finished) {
+                  finished = true;
+                  resolve(val);
+                }
+              };
+
+              const handleFailure = (err) => {
+                errorCount++;
+                errors.push(err);
+                if (errorCount === 2 && !finished) {
+                  finished = true;
+                  reject(new Error(`Both primary (${primaryName}) and fallback (${fallbackName}) DNS queries failed or timed out. Errors: ${errors.map(e => e.message).join(' | ')}`));
+                }
+              };
+
+              primaryPromise.then(handleSuccess).catch(handleFailure);
+              fallbackPromise.then(handleSuccess).catch(handleFailure);
+            });
+
+            res = raceResult.response;
+            winningProviderName = raceResult.name;
+          } catch (raceErr) {
+            console.error("DNS Staggered Race failed completely:", raceErr);
+            throw raceErr;
           }
 
           dohResponseStatus = res.status;
@@ -1100,7 +1231,7 @@ export default {
       // POST /api/users - Create custom subscriber
       if (method === 'POST' && url.pathname === '/api/users') {
         try {
-          const { username, traffic_limit_gb, expire_at } = await request.json();
+          const { username, traffic_limit_gb, expire_at, dns_provider } = await request.json();
           if (!username) {
             return jsonResponse({ error: 'Username is required' }, 400);
           }
@@ -1115,10 +1246,12 @@ export default {
             expiry = new Date(expire_at).toISOString();
           }
 
+          const providerToSave = dns_provider || null;
+
           await env.DB.prepare(`
-            INSERT INTO users (uuid, username, created_at, expire_at, traffic_limit_gb, query_count, used_gb, remaining_gb, enabled, last_activity)
-            VALUES (?, ?, ?, ?, ?, 0, 0.0, ?, 1, NULL)
-          `).bind(uuid, username, isoNow, expiry, limit, limit).run();
+            INSERT INTO users (uuid, username, created_at, expire_at, traffic_limit_gb, query_count, used_gb, remaining_gb, enabled, last_activity, dns_provider)
+            VALUES (?, ?, ?, ?, ?, 0, 0.0, ?, 1, NULL, ?)
+          `).bind(uuid, username, isoNow, expiry, limit, limit, providerToSave).run();
 
           return jsonResponse({ success: true, uuid });
         } catch (e) {
@@ -3192,17 +3325,18 @@ function getSubscriberPageHTML(user, host, providers, defaultDnsName) {
         <div class="space-y-2">
           <div class="flex justify-between items-center">
             <label class="text-xs font-semibold text-slate-300 block">Upstream DNS Resolver</label>
-            <span class="text-[10px] text-slate-500 font-medium">Managed by Administrator</span>
+            <span class="text-[10px] text-orange-500 font-semibold animate-pulse hidden" id="saving-status">● Saving Changes...</span>
+            <span class="text-[10px] text-slate-500 font-medium" id="resolver-status">Interactive Subscriber Mode</span>
           </div>
           <div class="relative">
-            <select id="resolver-select" disabled class="w-full px-4 py-3 rounded-xl border border-slate-800 bg-slate-950/50 text-slate-400 text-sm focus:outline-none appearance-none cursor-not-allowed opacity-70">
+            <select id="resolver-select" onchange="updateDnsProvider(this.value)" class="w-full px-4 py-3 rounded-xl border border-slate-700 bg-slate-950 text-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-orange-500/40 appearance-none cursor-pointer transition">
               ${enabledProviders.map(p => {
                 const isSel = p.name.toLowerCase() === activeProvider.toLowerCase();
                 return `<option value="${p.name}" ${isSel ? 'selected' : ''}>${p.name}</option>`;
               }).join('')}
             </select>
-            <div class="absolute inset-y-0 right-4 flex items-center pointer-events-none text-slate-500">
-              <i data-lucide="lock" class="w-4 h-4"></i>
+            <div class="absolute inset-y-0 right-4 flex items-center pointer-events-none text-slate-400">
+              <i data-lucide="chevron-down" class="w-4 h-4"></i>
             </div>
           </div>
         </div>
@@ -3324,6 +3458,44 @@ function getSubscriberPageHTML(user, host, providers, defaultDnsName) {
         btn.classList.add('bg-orange-500', 'hover:bg-orange-600');
         lucide.createIcons();
       }, 1500);
+    }
+
+    async function updateDnsProvider(dnsProvider) {
+      const savingEl = document.getElementById('saving-status');
+      const statusEl = document.getElementById('resolver-status');
+      
+      savingEl.classList.remove('hidden');
+      statusEl.classList.add('hidden');
+      
+      try {
+        const response = await fetch(window.location.href, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ dns_provider: dnsProvider })
+        });
+        
+        const data = await response.json();
+        if (response.ok && data.success) {
+          // Success! Flash save indicator
+          savingEl.textContent = '● Changes Saved!';
+          savingEl.className = 'text-[10px] text-emerald-400 font-semibold';
+          setTimeout(() => {
+            savingEl.classList.add('hidden');
+            savingEl.textContent = '● Saving Changes...';
+            savingEl.className = 'text-[10px] text-orange-500 font-semibold animate-pulse';
+            statusEl.classList.remove('hidden');
+          }, 1500);
+        } else {
+          alert('Failed to update DNS provider: ' + (data.error || 'Unknown error'));
+          window.location.reload();
+        }
+      } catch (err) {
+        console.error(err);
+        alert('Network error while updating DNS provider');
+        window.location.reload();
+      }
     }
 
     // Initialize connection link on load
