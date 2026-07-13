@@ -888,7 +888,7 @@ export default {
       if (!dohResponseBuffer) {
         try {
           // Extract queried domain name (QNAME) for logging or inspection if needed
-          let dnsBuffer = null;
+          let originalDnsBuffer = null;
           if (method === 'GET') {
             const dnsParam = url.searchParams.get('dns');
             if (dnsParam) {
@@ -900,15 +900,18 @@ export default {
                 for (let i = 0; i < binary.length; i++) {
                   bytes[i] = binary.charCodeAt(i);
                 }
-                dnsBuffer = bytes.buffer;
+                originalDnsBuffer = bytes.buffer;
               } catch (e) {}
             }
           } else if (method === 'POST' && requestBody) {
-            dnsBuffer = requestBody;
+            originalDnsBuffer = requestBody;
           }
 
-          // Inject EDNS Client Subnet (ECS) option to preserve geo-routing, low latency, and bypass game regional restrictions (Only if enabled)
-          if (dnsBuffer && isEcsEnabled) {
+          let dnsBuffer = originalDnsBuffer;
+
+          // Inject EDNS Client Subnet (ECS) option to preserve geo-routing, low latency, and bypass game regional restrictions (Only if enabled and NOT a gaming/anti-sanction DNS)
+          const shouldInjectEcs = isEcsEnabled && !isGamingDns(winningProviderName);
+          if (dnsBuffer && shouldInjectEcs) {
             dnsBuffer = addEcsToDnsQuery(dnsBuffer, clientIp);
             if (method === 'GET') {
               targetUrl.searchParams.set('dns', arrayBufferToBase64Url(dnsBuffer));
@@ -984,9 +987,24 @@ export default {
               // Perform DoH query to selected provider with a robust 4500ms timeout
               res = await fetchWithTimeout(primaryUrl, fetchOptions, 4500);
             } catch (firstErr) {
-              console.warn(`Primary DNS query to ${primaryName} failed, retrying same provider... Error:`, firstErr);
+              console.warn(`Primary DNS query to ${primaryName} failed, retrying same provider (without ECS for compatibility)... Error:`, firstErr);
               // Retry exactly once on the SAME user-selected provider to ensure maximum reliability with no cross-fallback leaks
-              res = await fetchWithTimeout(primaryUrl, fetchOptions, 4500);
+              // But on retry, we use the original unmodified DNS buffer (no ECS) in case ECS/packet manipulation was the cause of the failure!
+              let retryUrl = primaryUrl;
+              let retryOptions = { ...fetchOptions };
+
+              if (shouldInjectEcs) {
+                const cleanUrl = new URL(targetUrl.toString());
+                if (method === 'GET' && originalDnsBuffer) {
+                  cleanUrl.searchParams.set('dns', arrayBufferToBase64Url(originalDnsBuffer));
+                }
+                retryUrl = cleanUrl.toString();
+                if (method !== 'GET' && method !== 'HEAD' && originalDnsBuffer) {
+                  retryOptions.body = originalDnsBuffer;
+                }
+              }
+
+              res = await fetchWithTimeout(retryUrl, retryOptions, 4500);
             }
           } catch (err) {
             console.error(`DNS query to selected provider ${primaryName} failed completely:`, err);
