@@ -1,4 +1,4 @@
-name = "doh-subscription-worker"
+name = "doh-picko"
 main = "worker.js"
 compatibility_date = "2024-03-03"
 
