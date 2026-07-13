@@ -4,6 +4,8 @@
  * Simulates Cloudflare D1 with a local sqlite3 file, and KV with local JSON files.
  */
 
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+
 import express from 'express';
 import path from 'path';
 import fs from 'fs';
