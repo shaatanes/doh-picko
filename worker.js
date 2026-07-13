@@ -950,30 +950,8 @@ export default {
 
           const queriedDomain = extractQName(dnsBuffer);
 
-          // Determine URLs and names for the staggered race
           const primaryUrl = targetUrl.toString();
           const primaryName = winningProviderName;
-
-          let fallbackUrl = 'https://8.8.8.8/dns-query';
-          let fallbackName = 'Google (Fallback)';
-
-          if (isGamingDns(primaryName)) {
-            // Find another enabled gaming/anti-sanction provider as a high-performance fallback
-            const otherGaming = providers.find(p => p.enabled && p.name.toLowerCase() !== primaryName.toLowerCase() && isGamingDns(p.name));
-            if (otherGaming) {
-              fallbackUrl = otherGaming.url;
-              fallbackName = `${otherGaming.name} (Fallback)`;
-            }
-          } else {
-            // For general providers, use Google/Cloudflare as fallback
-            if (primaryName.toLowerCase().includes('cloudflare')) {
-              fallbackUrl = 'https://8.8.8.8/dns-query';
-              fallbackName = 'Google (Fallback)';
-            } else {
-              fallbackUrl = 'https://1.1.1.1/dns-query';
-              fallbackName = 'Cloudflare (Fallback)';
-            }
-          }
 
           // Helper to fetch with an exact timeout
           const fetchWithTimeout = async (urlStr, options, timeoutMs) => {
@@ -994,95 +972,25 @@ export default {
 
           let res;
           try {
-            let finished = false;
-            let startFallback;
-            const fallbackTrigger = new Promise(resolve => {
-              startFallback = resolve;
-            });
+            const fetchOptions = {
+              method,
+              headers: forwardHeaders
+            };
+            if (method !== 'GET' && method !== 'HEAD' && dnsBuffer) {
+              fetchOptions.body = dnsBuffer;
+            }
 
-            const staggerTimer = setTimeout(() => {
-              if (startFallback) startFallback();
-            }, 600);
-
-            // Staggered racing execution:
-            // 1. Kick off primary DNS query with 2500ms timeout
-            // 2. Wait for 600ms. If primary has not responded, or if primary fails early, kick off fallback DNS query
-            // 3. Return whichever successful response completes first!
-            const primaryPromise = (async () => {
-              try {
-                const fetchOptions = {
-                  method,
-                  headers: forwardHeaders
-                };
-                if (method !== 'GET' && method !== 'HEAD' && dnsBuffer) {
-                  fetchOptions.body = dnsBuffer;
-                }
-                const r = await fetchWithTimeout(primaryUrl, fetchOptions, 2500);
-                return { response: r, name: primaryName };
-              } catch (err) {
-                // If primary fails early, trigger fallback immediately to save time!
-                if (startFallback) startFallback();
-                throw err;
-              }
-            })();
-
-            const fallbackPromise = (async () => {
-              await fallbackTrigger; // Wait for 600ms stagger or early primary failure
-              clearTimeout(staggerTimer);
-
-              if (finished) {
-                throw new Error("Already resolved");
-              }
-              const fetchOptions = {
-                method,
-                headers: forwardHeaders
-              };
-              if (method !== 'GET' && method !== 'HEAD' && dnsBuffer) {
-                fetchOptions.body = dnsBuffer;
-              }
-              // Adjust fallback URL search parameters for GET request if dnsBuffer is mutated
-              const finalFallbackUrl = new URL(fallbackUrl);
-              for (const [key, value] of url.searchParams.entries()) {
-                if (key !== 'provider') {
-                  finalFallbackUrl.searchParams.set(key, value);
-                }
-              }
-              if (dnsBuffer && isEcsEnabled) {
-                finalFallbackUrl.searchParams.set('dns', arrayBufferToBase64Url(dnsBuffer));
-              }
-              const r = await fetchWithTimeout(finalFallbackUrl.toString(), fetchOptions, 2000);
-              return { response: r, name: fallbackName };
-            })();
-
-            const raceResult = await new Promise((resolve, reject) => {
-              let errorCount = 0;
-              const errors = [];
-
-              const handleSuccess = (val) => {
-                if (!finished) {
-                  finished = true;
-                  resolve(val);
-                }
-              };
-
-              const handleFailure = (err) => {
-                errorCount++;
-                errors.push(err);
-                if (errorCount === 2 && !finished) {
-                  finished = true;
-                  reject(new Error(`Both primary (${primaryName}) and fallback (${fallbackName}) DNS queries failed or timed out. Errors: ${errors.map(e => e.message).join(' | ')}`));
-                }
-              };
-
-              primaryPromise.then(handleSuccess).catch(handleFailure);
-              fallbackPromise.then(handleSuccess).catch(handleFailure);
-            });
-
-            res = raceResult.response;
-            winningProviderName = raceResult.name;
-          } catch (raceErr) {
-            console.error("DNS Staggered Race failed completely:", raceErr);
-            throw raceErr;
+            try {
+              // Perform DoH query to selected provider with a robust 4500ms timeout
+              res = await fetchWithTimeout(primaryUrl, fetchOptions, 4500);
+            } catch (firstErr) {
+              console.warn(`Primary DNS query to ${primaryName} failed, retrying same provider... Error:`, firstErr);
+              // Retry exactly once on the SAME user-selected provider to ensure maximum reliability with no cross-fallback leaks
+              res = await fetchWithTimeout(primaryUrl, fetchOptions, 4500);
+            }
+          } catch (err) {
+            console.error(`DNS query to selected provider ${primaryName} failed completely:`, err);
+            throw err;
           }
 
           dohResponseStatus = res.status;
