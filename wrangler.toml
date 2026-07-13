@@ -9,9 +9,9 @@ NODE_ENV = "production"
 [[d1_databases]]
 binding = "DB"
 database_name = "doh_subscription_db"
-database_id = "YOUR_D1_DATABASE_ID_HERE" # Put your D1 database UUID here
+database_id = "175b738a-c5fd-4e0f-a4de-4fa7e93d599e" # Put your D1 database UUID here
 migrations_dir = "migrations"
 
 [[kv_namespaces]]
 binding = "KV"
-id = "YOUR_KV_NAMESPACE_ID_HERE" # Put your KV namespace ID here
+id = "414d7911505f4dddbd6faee06048a202" # Put your KV namespace ID here
