@@ -978,7 +978,7 @@ export default {
           };
 
           // Smart UDP DNS Helper for Node.js environments
-          async function tryIranianDnsUdp(providerName, dnsBuffer, timeoutMs = 2000) {
+          async function tryDnsUdp(providerName, dnsBuffer, targetUrl, timeoutMs = 2000) {
             if (typeof process === 'undefined' || !process.versions || !process.versions.node) {
               return null; // Only run inside Node.js simulation container where dgram is fully available
             }
@@ -986,18 +986,59 @@ export default {
             const lowerName = providerName.toLowerCase();
             let ips = [];
             
-            if (lowerName.includes('shecan') || lowerName.includes('شکن')) {
+            if (lowerName.includes('cloudflare')) {
+              ips = ['1.1.1.1', '1.0.0.1'];
+            } else if (lowerName.includes('google')) {
+              ips = ['8.8.8.8', '8.8.4.4'];
+            } else if (lowerName.includes('nordvpn') || lowerName.includes('nord')) {
+              ips = ['103.86.96.100', '103.86.99.100'];
+            } else if (lowerName.includes('quad9')) {
+              ips = ['9.9.9.9', '149.112.112.112'];
+            } else if (lowerName.includes('adguard')) {
+              ips = ['94.140.14.14', '94.140.15.15'];
+            } else if (lowerName.includes('opendns')) {
+              ips = ['208.67.222.222', '208.67.220.220'];
+            } else if (lowerName.includes('shecan') || lowerName.includes('شکن')) {
               ips = ['178.22.122.100', '178.22.122.101', '185.51.200.2'];
             } else if (lowerName.includes('403')) {
-              ips = ['108.61.170.199'];
+              ips = ['10.202.10.10', '10.202.10.11', '108.61.170.199'];
             } else if (lowerName.includes('electro') || lowerName.includes('الکترو')) {
-              // Try Electro's DNS first, then fallback to Shecan/403 for active continuity
-              ips = ['78.157.108.10', '178.22.122.100', '108.61.170.199'];
+              ips = ['78.157.108.10', '78.157.108.11', '178.22.122.100', '10.202.10.10'];
             } else if (lowerName.includes('radar') || lowerName.includes('رادار')) {
-              // Radar Game is intranet-only, fallback to Shecan / 403 online for optimal game unblocking
-              ips = ['178.22.122.100', '108.61.170.199'];
-            } else {
-              return null; // Not an Iranian anti-sanction provider
+              ips = ['10.202.10.10', '10.202.10.11', '178.22.122.100'];
+            } else if (lowerName.includes('ali') || lowerName.includes('alibaba')) {
+              ips = ['223.5.5.5', '223.6.6.6'];
+            } else if (lowerName.includes('114')) {
+              ips = ['114.114.114.114', '114.114.115.115'];
+            } else if (lowerName.includes('cleanbrowsing')) {
+              ips = ['185.228.168.9', '185.228.169.9'];
+            } else if (lowerName.includes('controld')) {
+              ips = ['76.76.2.0', '76.76.10.0'];
+            } else if (lowerName.includes('nextdns')) {
+              ips = ['45.90.28.0', '45.90.30.0'];
+            } else if (lowerName.includes('dns.sb')) {
+              ips = ['185.222.222.222', '185.184.222.222'];
+            } else if (lowerName.includes('yandex')) {
+              ips = ['77.88.8.8', '77.88.8.1'];
+            } else if (lowerName.includes('comodo')) {
+              ips = ['8.26.56.26', '8.20.247.20'];
+            } else if (lowerName.includes('norton')) {
+              ips = ['199.85.126.10', '199.85.127.10'];
+            }
+            
+            // Check if target URL hostname is an IP address
+            if (targetUrl) {
+              const ipPattern = /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/;
+              if (ipPattern.test(targetUrl.hostname)) {
+                if (!ips.includes(targetUrl.hostname)) {
+                  ips.unshift(targetUrl.hostname); // Prioritize direct IP if configured
+                }
+              }
+            }
+            
+            // Fallback to Google and Cloudflare if no matches found
+            if (ips.length === 0) {
+              ips = ['8.8.8.8', '1.1.1.1'];
             }
             
             let dgram;
@@ -1071,8 +1112,8 @@ export default {
 
           let res;
           try {
-            // First, try ultra-low latency direct UDP DNS for Iranian providers
-            const udpRes = await tryIranianDnsUdp(primaryName, dnsBuffer);
+            // Try ultra-low latency direct UDP DNS for optimal speed and maximum reliability (works for both public and Iranian anti-sanction servers)
+            const udpRes = await tryDnsUdp(primaryName, dnsBuffer, targetUrl);
             if (udpRes) {
               res = udpRes;
               console.log(`Successfully completed DNS query via ultra-fast UDP for ${primaryName}`);
