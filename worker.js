@@ -26,7 +26,7 @@ const DNS_CACHE_TTL = 300000; // 5 minutes (300 seconds Cache) for ultra-low lat
 // Default list of built-in DNS Providers
 const DEFAULT_DNS_PROVIDERS = [
   { name: 'Cloudflare', url: 'https://1.1.1.1/dns-query', enabled: true, is_built_in: true },
-  { name: 'Google', url: 'https://8.8.8.8/dns-query', enabled: true, is_built_in: true },
+  { name: 'Google', url: 'https://dns.google/dns-query', enabled: true, is_built_in: true },
   { name: 'Radar Game (رادار گیم)', url: 'https://doh.radar.game/dns-query', enabled: true, is_built_in: true },
   { name: 'Electro DNS (الکترو)', url: 'https://doh.electro.ir/dns-query', enabled: true, is_built_in: true },
   { name: '403 Online (۴۰۳ آنلاین)', url: 'https://dns.403.ir/dns-query', enabled: true, is_built_in: true },
@@ -34,7 +34,7 @@ const DEFAULT_DNS_PROVIDERS = [
   { name: 'NordVPN DNS', url: 'https://doh.nordvpn.com/dns-query', enabled: true, is_built_in: true },
   { name: 'Ali DNS (Alibaba)', url: 'https://dns.alidns.com/dns-query', enabled: true, is_built_in: true },
   { name: '114 DNS (Tencent)', url: 'https://doh.pub/dns-query', enabled: true, is_built_in: true },
-  { name: 'Norton Family', url: 'https://doh.family.norton.com/dns-query', enabled: true, is_built_in: true },
+  { name: 'Cloudflare Security', url: 'https://security.cloudflare-dns.com/dns-query', enabled: true, is_built_in: true },
   { name: 'Quad9', url: 'https://dns.quad9.net/dns-query', enabled: true, is_built_in: true },
   { name: 'AdGuard DNS', url: 'https://dns.adguard-dns.com/dns-query', enabled: true, is_built_in: true },
   { name: 'OpenDNS', url: 'https://doh.opendns.com/dns-query', enabled: true, is_built_in: true },
@@ -42,8 +42,8 @@ const DEFAULT_DNS_PROVIDERS = [
   { name: 'ControlD', url: 'https://dns.controld.com/freedns', enabled: true, is_built_in: true },
   { name: 'NextDNS', url: 'https://dns.nextdns.io', enabled: true, is_built_in: true },
   { name: 'DNS.SB', url: 'https://doh.dns.sb/dns-query', enabled: true, is_built_in: true },
-  { name: 'Yandex DNS', url: 'https://common.dns.yandex.ru/dns-query', enabled: true, is_built_in: true },
-  { name: 'Comodo DNS', url: 'https://doh.securactive.net/dns-query', enabled: true, is_built_in: true }
+  { name: 'Cloudflare Family', url: 'https://family.cloudflare-dns.com/dns-query', enabled: true, is_built_in: true },
+  { name: 'AdGuard Family', url: 'https://family.adguard-dns.com/dns-query', enabled: true, is_built_in: true }
 ];
 
 // Database Initialization SQL
@@ -987,7 +987,13 @@ export default {
             let ips = [];
             
             if (lowerName.includes('cloudflare')) {
-              ips = ['1.1.1.1', '1.0.0.1'];
+              if (lowerName.includes('security')) {
+                ips = ['1.1.1.2', '1.0.0.2'];
+              } else if (lowerName.includes('family')) {
+                ips = ['1.1.1.3', '1.0.0.3'];
+              } else {
+                ips = ['1.1.1.1', '1.0.0.1'];
+              }
             } else if (lowerName.includes('google')) {
               ips = ['8.8.8.8', '8.8.4.4'];
             } else if (lowerName.includes('nordvpn') || lowerName.includes('nord')) {
@@ -995,7 +1001,11 @@ export default {
             } else if (lowerName.includes('quad9')) {
               ips = ['9.9.9.9', '149.112.112.112'];
             } else if (lowerName.includes('adguard')) {
-              ips = ['94.140.14.14', '94.140.15.15'];
+              if (lowerName.includes('family')) {
+                ips = ['94.140.14.15', '94.140.15.16'];
+              } else {
+                ips = ['94.140.14.14', '94.140.15.15'];
+              }
             } else if (lowerName.includes('opendns')) {
               ips = ['208.67.222.222', '208.67.220.220'];
             } else if (lowerName.includes('shecan') || lowerName.includes('شکن')) {
@@ -1018,12 +1028,6 @@ export default {
               ips = ['45.90.28.0', '45.90.30.0'];
             } else if (lowerName.includes('dns.sb')) {
               ips = ['185.222.222.222', '185.184.222.222'];
-            } else if (lowerName.includes('yandex')) {
-              ips = ['77.88.8.8', '77.88.8.1'];
-            } else if (lowerName.includes('comodo')) {
-              ips = ['8.26.56.26', '8.20.247.20'];
-            } else if (lowerName.includes('norton')) {
-              ips = ['199.85.126.10', '199.85.127.10'];
             }
             
             // Check if target URL hostname is an IP address
@@ -1165,7 +1169,40 @@ export default {
             }
           } catch (err) {
             console.error(`DNS query to selected provider ${primaryName} failed completely:`, err);
-            throw err;
+            
+            // Self-healing failover: If selected provider is broken/blocked, automatically fallback to ultra-reliable Cloudflare DNS (1.1.1.1) to preserve client connectivity!
+            if (primaryName.toLowerCase() !== 'cloudflare') {
+              console.warn(`[FAILOVER] Primary provider ${primaryName} is unreachable. Falling back to Cloudflare DNS to preserve client connectivity...`);
+              try {
+                const fallbackUrl = 'https://1.1.1.1/dns-query';
+                const fallbackUdp = await tryDnsUdp('Cloudflare', dnsBuffer, new URL(fallbackUrl));
+                if (fallbackUdp) {
+                  res = fallbackUdp;
+                } else {
+                  const fallbackOptions = {
+                    method,
+                    headers: new Headers({
+                      'Accept': 'application/dns-message',
+                      'User-Agent': 'DNS-over-HTTPS-Subscription/Failover-1.0'
+                    })
+                  };
+                  if (method === 'POST') {
+                    fallbackOptions.headers.set('Content-Type', 'application/dns-message');
+                  }
+                  if (method !== 'GET' && method !== 'HEAD' && dnsBuffer) {
+                    fallbackOptions.body = dnsBuffer;
+                  }
+                  const fallbackGetUrl = method === 'GET' && dnsBuffer ? fallbackUrl + '?dns=' + arrayBufferToBase64Url(dnsBuffer) : fallbackUrl;
+                  res = await fetchWithTimeout(fallbackGetUrl, fallbackOptions, 4000);
+                }
+                console.log(`[FAILOVER] Successfully resolved query via fallback Cloudflare DNS.`);
+              } catch (fallbackErr) {
+                console.error(`[FAILOVER] Fallback Cloudflare DNS also failed:`, fallbackErr);
+                throw err; // Throw original error if fallback also fails
+              }
+            } else {
+              throw err;
+            }
           }
 
           dohResponseStatus = res.status;
